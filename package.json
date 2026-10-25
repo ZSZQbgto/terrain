@@ -1,0 +1,22 @@
+{
+  "name": "terrain-viewer",
+  "version": "1.0.0",
+  "description": "8km DEM 高程分层着色 / 卫星影像覆盖三维地形浏览器",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "assets": "node scripts/prepare-assets.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "sharp": "^0.35.5",
+    "vite": "^7.3.7"
+  }
+}

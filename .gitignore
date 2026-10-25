@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+*.log
+.DS_Store
+
+# 离线管线的输出（可由 npm run assets 重新生成）
+public/data/
+
+/.idea/

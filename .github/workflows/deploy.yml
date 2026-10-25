@@ -1,0 +1,85 @@
+# CI：push / PR 做构建校验；push 到 master 时把 dist 发布到 GitHub Pages。
+#
+# 数据来源：public/data 在 .gitignore 里（二进制产物），由 resourses/ 里的源图
+# 在构建阶段用 `npm run assets` 现场生成。卫星源图不在仓库，管线会自动跳过卫星瓦片，
+# 因此站点只展示高程分层地形（页面运行时探测瓦片，缺了就降级，不会报错）。
+#
+# 首次使用需要在仓库 Settings → Pages → Build and deployment → Source
+# 选择 "GitHub Actions"。
+name: Build & Deploy
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一个 Pages 发布，新的 push 不打断正在进行的部署
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建校验
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 生成地形资产
+        run: npm run assets
+
+      - name: 校验地形资产
+        # assets 缺源图时是"跳过"而不是失败，这里显式把关，
+        # 避免把没有地形数据的站点发出去
+        run: |
+          test -f public/data/height.f16
+          test -f public/data/terrain.json
+
+      - name: 构建
+        run: npm run build
+
+      - name: 校验构建产物
+        run: |
+          test -f dist/index.html
+          test -f dist/data/height.f16
+          test -f dist/data/terrain.json
+
+      - name: 配置 Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: 上传 Pages 产物
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: 部署到 GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 发布
+        id: deployment
+        uses: actions/deploy-pages@v4
