@@ -167,7 +167,9 @@ export class TerrainControls {
         fwd.y = 0;
         if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
         fwd.normalize();
-        const side = new THREE.Vector3(fwd.z, 0, -fwd.x);
+        // 水平右方向 = fwd × up（y 向上右手系）：面朝 -Z 时得到 +X。
+        // 写成 (-fwd.z, 0, fwd.x)；取反会让 A/D 左右颠倒。
+        const side = new THREE.Vector3(-fwd.z, 0, fwd.x);
 
         const move = new THREE.Vector3()
           .addScaledVector(fwd, forward * step)
