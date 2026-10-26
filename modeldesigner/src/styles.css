@@ -580,6 +580,12 @@ input[type="checkbox"] {
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
 .nav-btn:hover { background: rgba(255, 255, 255, 0.11); }
+/* 顶栏里的链接按钮（返回主项目） */
+a.nav-btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
 .nav-btn.active {
   background: linear-gradient(180deg, #2c74a8, #235b86);
   border-color: rgba(78, 163, 216, 0.55);
@@ -659,6 +665,30 @@ input[type="checkbox"] {
   border-radius: 50%;
   background: var(--accent);
 }
+
+/* ── 游览模式：隐藏所有 UI，只留退出按钮 ───────────────────────────────── */
+body.tour-mode #ui,
+body.tour-mode #labels { display: none !important; }
+body.tour-mode { cursor: grab; }
+body.tour-mode:active { cursor: grabbing; }
+#tour-exit {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 40;
+  padding: 9px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(120, 190, 240, 0.45);
+  background: rgba(18, 26, 34, 0.82);
+  backdrop-filter: blur(10px);
+  color: #eaf6ff;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  transition: background 0.15s;
+}
+#tour-exit:hover { background: rgba(44, 116, 168, 0.9); }
 
 /* 底部提示 */
 #hint {

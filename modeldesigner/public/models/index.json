@@ -1,10 +1,10 @@
 {
-  "generatedAt": "2026-10-26T09:00:34.824Z",
+  "generatedAt": "2026-10-26T15:00:59.092Z",
   "files": [
     {
-      "name": "sample-tower.glb",
-      "url": "models/sample-tower.glb",
-      "size": 1980
+      "name": "大坝_04.glb",
+      "url": "models/%E5%A4%A7%E5%9D%9D_04.glb",
+      "size": 1464024
     }
   ]
 }

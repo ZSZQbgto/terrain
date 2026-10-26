@@ -1,5 +1,5 @@
 /**
- * 装配：地形渲染（复用 terrain 模块） + 模型沙盘编辑器。
+ * 装配：地形渲染（复用 terrain 模块） + 地形模型编辑。
  *
  * 渲染分层：
  *   WebGL 场景（地形 / 天空 / 水面 / 模型）→ FXAA 后处理 → canvas
@@ -284,6 +284,7 @@ async function main() {
     onDrawFlow: () => waterEditor.start('flow'),
     onMode: (mode) => patchSettings({ uiMode: mode }),
     onFogChange: (scale) => applyFog(scale),
+    onToggleTour: () => applyTour(!tourOn),
     onWaterUndoPoint: () => waterEditor.undoPoint(),
     onWaterFinish: () => waterEditor.finish(),
     onWaterCancel: () => waterEditor.cancel(),
@@ -309,6 +310,26 @@ async function main() {
   applyCollision(collisionOn); // 相机碰撞开关
   applyWater(waterOn); // 水面总开关
   applyFog(initialSettings.fog ?? 1); // 薄雾强度（地形 + 水面 + 模型）
+  // ── 游览模式：隐藏全部 UI，相机开启惯性缓动 ────────────────────────────
+  let tourOn = false;
+  const applyTour = (on) => {
+    const next = Boolean(on);
+    if (next && waterEditor.active) waterEditor.cancel(); // 别把正在画的点带进游览
+    tourOn = next;
+    ui?.setTourState(tourOn);
+    cameraControls.setInertia(tourOn);
+    if (tourOn) {
+      ui?.toast('游览模式：拖动旋转 · 滚轮缩放 · WASD 平移（带惯性）· Esc 退出');
+    } else {
+      ui?.resetHint?.();
+    }
+  };
+
+  document.getElementById('tour-exit')?.addEventListener('click', () => applyTour(false));
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && tourOn) applyTour(false);
+  });
+
   // 恢复上次的界面模式（模型编辑 / 水体编辑），并渲染对应面板
   ui.setMode(initialSettings.uiMode === 'water' ? 'water' : 'models');
 
@@ -492,6 +513,7 @@ async function main() {
     budget,
     cameraControls,
     satellite,
+    applyTour,
     applyTextures,
     isTexturesOn: () => texturesOn,
   };

@@ -35,7 +35,7 @@ export class Hud {
 
     this.root.innerHTML = `
       <div class="panel stats">
-        <div class="title">尚庄炉水库 · 8 km 三维地形</div>
+        <div class="title">地形查看 · 8 km 三维地形</div>
         <div class="row"><span>FPS</span><b id="hud-fps">--</b></div>
         <div class="row"><span>帧时间</span><b id="hud-ms">--</b></div>
         <div class="row"><span>三角面</span><b id="hud-tris">--</b></div>
@@ -76,8 +76,12 @@ export class Hud {
       </div>
 
       <div class="tip">
-        左键拖拽旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 平移 · Q/E 升降 · Shift 加速 · 双击聚焦
+        左键拖拽旋转 · 右键平移 · 滚轮缩放 · W/A/S/D 平移 · Q/E 升降 · Shift 加速 · Ctrl 慢速 · 双击聚焦
       </div>
+      <!-- 前往地形模型编辑：dev 下在 5174 独立运行，构建后由 Pages 部署到 ./modeldesigner/ -->
+      <a class="editor-link"
+         href="${import.meta.env?.DEV ? 'http://127.0.0.1:5174/' : './modeldesigner/'}"
+         target="_blank" rel="noopener">打开地形模型编辑 →</a>
     `;
 
     this.el = {

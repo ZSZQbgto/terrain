@@ -38,6 +38,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          # 两个前端各有一份 lockfile
+          cache-dependency-path: |
+            package-lock.json
+            modeldesigner/package-lock.json
 
       - name: 安装依赖
         run: npm ci
@@ -52,14 +56,40 @@ jobs:
           test -f public/data/height.f16
           test -f public/data/terrain.json
 
-      - name: 构建
+      - name: 构建主项目
         run: npm run build
 
-      - name: 校验构建产物
+      - name: 校验主项目产物
         run: |
           test -f dist/index.html
           test -f dist/data/height.f16
           test -f dist/data/terrain.json
+
+      # ── 第二个前端：地形模型编辑，部署到 dist/modeldesigner/ ──────────────
+      - name: 安装编辑器依赖
+        working-directory: modeldesigner
+        run: npm ci
+
+      - name: 生成编辑器地形资产
+        working-directory: modeldesigner
+        run: npm run assets
+
+      - name: 构建编辑器
+        working-directory: modeldesigner
+        run: npm run build
+
+      - name: 合并编辑器到 dist/modeldesigner
+        run: |
+          test -f modeldesigner/dist/index.html
+          mkdir -p dist/modeldesigner
+          cp -r modeldesigner/dist/. dist/modeldesigner/
+
+      - name: 校验双前端产物
+        run: |
+          test -f dist/index.html
+          test -f dist/modeldesigner/index.html
+          test -f dist/modeldesigner/data/height.f16
+          test -f dist/modeldesigner/data/terrain.json
 
       - name: 配置 Pages
         if: github.event_name != 'pull_request'

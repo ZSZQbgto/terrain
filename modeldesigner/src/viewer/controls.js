@@ -37,6 +37,11 @@ export class TerrainControls {
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2(0, 0);
     this.enabled = true;
+    // 游览模式的相机惯性：起步缓动 + 松键后滑行
+    this.inertia = false;
+    this.velocity = new THREE.Vector3();
+    this._desired = new THREE.Vector3();
+    this._move = new THREE.Vector3();
     this.collisionEnabled = true; // 相机碰撞：不钻地、不出地形边界
     this.modifiers = { shift: false, ctrl: false }; // Ctrl=缓动，Shift=加速
     this._onKeyDown = (e) => {
@@ -73,6 +78,14 @@ export class TerrainControls {
    * 注意必须同时设置 OrbitControls 的 enabled —— 只改 this.enabled 时，
    * 鼠标左键拖动仍会旋转视角（编辑器里拖 gizmo 时会和物体抢指针）。
    */
+  /** 游览模式：相机惯性（起步缓动 + 松键滑行），旋转也更柔 */
+  setInertia(on) {
+    this.inertia = Boolean(on);
+    this.controls.dampingFactor = this.inertia ? 0.05 : 0.075;
+    this.controls.rotateSpeed = this.inertia ? 0.52 : 0.62;
+    if (!this.inertia) this.velocity.set(0, 0, 0);
+  }
+
   setEnabled(on) {
     this.enabled = on;
     this.controls.enabled = on;
@@ -187,12 +200,13 @@ export class TerrainControls {
       if (this.keys.has('KeyE')) up += 1;
       if (this.keys.has('KeyQ')) up -= 1;
 
+      const dtClamped = Math.min(dt, 0.05);
+      // 期望速度（单位/秒）：Ctrl（⌘）= 缓动精细移动，Shift = 加速
+      this._desired.set(0, 0, 0);
       if (forward || right || up) {
         const dist = c.position.distanceTo(target);
-        // Ctrl（⌘）= 缓动精细移动，Shift = 加速
         const boost = this.modifiers.ctrl ? 0.25 : this.modifiers.shift ? 3.2 : 1;
         const speed = Math.max(120, dist * 0.85) * boost;
-        const step = speed * Math.min(dt, 0.05);
 
         const fwd = new THREE.Vector3().subVectors(target, c.position);
         fwd.y = 0;
@@ -202,13 +216,27 @@ export class TerrainControls {
         // 写成 (-fwd.z, 0, fwd.x)；取反会让 A/D 左右颠倒。
         const side = new THREE.Vector3(-fwd.z, 0, fwd.x);
 
-        const move = new THREE.Vector3()
-          .addScaledVector(fwd, forward * step)
-          .addScaledVector(side, right * step);
-        move.y += up * step;
+        this._desired.addScaledVector(fwd, forward).addScaledVector(side, right);
+        this._desired.y += up;
+        if (this._desired.lengthSq() > 1e-6) this._desired.normalize().multiplyScalar(speed);
+      }
 
-        c.position.add(move);
-        target.add(move);
+      if (this.inertia) {
+        // 游览模式：起步缓动、松键后滑行（指数衰减），不硬停
+        const k =
+          this._desired.lengthSq() > 0
+            ? 1 - Math.exp(-dtClamped * 6.5)
+            : 1 - Math.exp(-dtClamped * 1.7);
+        this.velocity.lerp(this._desired, Math.min(1, Math.max(0.02, k)));
+        if (this._desired.lengthSq() === 0 && this.velocity.lengthSq() < 1) this.velocity.set(0, 0, 0);
+      } else {
+        this.velocity.copy(this._desired);
+      }
+
+      if (this.velocity.lengthSq() > 1e-6) {
+        this._move.copy(this.velocity).multiplyScalar(dtClamped);
+        c.position.add(this._move);
+        target.add(this._move);
 
         // 平移后把移动量投影回地表高度，保持观察点贴地
         const ground = this.hf.sampleWorld(target.x, target.z) * this.hf.reliefMeters * this.getExaggeration();

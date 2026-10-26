@@ -45,6 +45,7 @@ export class Ui {
     onWaterFinish,
     onWaterCancel,
     onFogChange,
+    onToggleTour,
     onMode,
   }) {
     this.editor = editor;
@@ -68,6 +69,7 @@ export class Ui {
     this.onWaterFinish = onWaterFinish;
     this.onWaterCancel = onWaterCancel;
     this.onFogChange = onFogChange;
+    this.onToggleTour = onToggleTour;
     this.onMode = onMode;
     this.mode = 'models';
 
@@ -88,7 +90,10 @@ export class Ui {
   _buildShell() {
     // 顶栏：项目管理 / 模型编辑 / 水体编辑 / 图形选项
     this.toolbar.innerHTML = `
-      <div class="brand">模型沙盘编辑器<small>尚庄炉水库 · 8 km 地形</small></div>
+      <div class="brand">地形模型编辑<small>8 km 地形沙盘</small></div>
+      <!-- 返回地形查看：dev 下主项目在 5173，构建后是 Pages 上一级目录 -->
+      <a class="nav-btn" href="${import.meta.env?.DEV ? 'http://127.0.0.1:5173/' : '../'}"
+         title="返回地形查看">← 地形查看</a>
       <nav class="nav">
         <div class="nav-group" data-group="project">
           <button class="nav-btn" data-menu="project">项目管理 ▾</button>
@@ -115,6 +120,8 @@ export class Ui {
             </label>
           </div>
         </div>
+        <button class="nav-btn" data-act="tour"
+                title="隐藏所有面板，进入无 UI 游览（相机带惯性与缓动）">游览</button>
       </nav>
       <div class="spacer"></div>
       <div class="stats" id="tb-stats">--</div>
@@ -915,6 +922,14 @@ export class Ui {
     if (out) out.textContent = `${scale.toFixed(1)}×`;
   }
 
+  /** 游览模式：隐藏全部 UI 与场景标签，只留右下角退出按钮 */
+  setTourState(on) {
+    const tour = Boolean(on);
+    document.body.classList.toggle('tour-mode', tour);
+    const exit = document.getElementById('tour-exit');
+    if (exit) exit.hidden = !tour;
+  }
+
   /** 顶栏菜单与面板按钮共用的动作分派 */
   _runAction(act, btn) {
     if (act === 'import') this.onImportFiles?.();
@@ -928,7 +943,7 @@ export class Ui {
     else if (act === 'toggle-water') this.onToggleWater?.();
     else if (act === 'draw-area') this.onDrawArea?.();
     else if (act === 'draw-flow') this.onDrawFlow?.();
-    else if (act === 'reset') {
+    else if (act === 'tour') this.onToggleTour?.();    else if (act === 'reset') {
       if (confirm('清空所有场景模型与本地工程？（资源文件夹里的 glb 不会被删除）')) this.onReset?.();
     }
   }

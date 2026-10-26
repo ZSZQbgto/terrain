@@ -37,8 +37,23 @@ export class TerrainControls {
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2(0, 0);
     this.enabled = true;
+    // 相机惯性（游览模式开启）：松键后按指数衰减滑行，而不是硬停
+    this.inertia = false;
+    this.velocity = new THREE.Vector3();
+    this._desired = new THREE.Vector3();
+    this._move = new THREE.Vector3();
     this._onKeyDown = (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+      // 修饰键只记状态（Shift 加速 / Ctrl 慢速微调），不拦截浏览器默认行为
+      if (
+        e.code === 'ShiftLeft' ||
+        e.code === 'ShiftRight' ||
+        e.code === 'ControlLeft' ||
+        e.code === 'ControlRight'
+      ) {
+        this.keys.add(e.code);
+        return;
+      }
       if (KEY_SPEED[e.code]) {
         this.keys.add(e.code);
         e.preventDefault();
@@ -49,6 +64,14 @@ export class TerrainControls {
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
     window.addEventListener('blur', this._onBlur);
+  }
+
+  /** 游览模式：相机惯性（起步缓动 + 松键滑行），旋转也更柔 */
+  setInertia(on) {
+    this.inertia = Boolean(on);
+    this.controls.dampingFactor = this.inertia ? 0.05 : 0.075;
+    this.controls.rotateSpeed = this.inertia ? 0.52 : 0.62;
+    if (!this.inertia) this.velocity.set(0, 0, 0);
   }
 
   setTarget(x, y, z) {
@@ -158,10 +181,18 @@ export class TerrainControls {
       if (this.keys.has('KeyE')) up += 1;
       if (this.keys.has('KeyQ')) up -= 1;
 
+      const dtClamped = Math.min(dt, 0.05);
+      // 期望速度（单位/秒）：Shift 加速 3.2×，Ctrl 慢速微调 0.25×
+      this._desired.set(0, 0, 0);
       if (forward || right || up) {
         const dist = c.position.distanceTo(target);
-        const speed = Math.max(120, dist * 0.85) * (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 3.2 : 1);
-        const step = speed * Math.min(dt, 0.05);
+        const boost =
+          this.keys.has('ControlLeft') || this.keys.has('ControlRight')
+            ? 0.25
+            : this.keys.has('ShiftLeft') || this.keys.has('ShiftRight')
+              ? 3.2
+              : 1;
+        const speed = Math.max(120, dist * 0.85) * boost;
 
         const fwd = new THREE.Vector3().subVectors(target, c.position);
         fwd.y = 0;
@@ -171,13 +202,27 @@ export class TerrainControls {
         // 写成 (-fwd.z, 0, fwd.x)；取反会让 A/D 左右颠倒。
         const side = new THREE.Vector3(-fwd.z, 0, fwd.x);
 
-        const move = new THREE.Vector3()
-          .addScaledVector(fwd, forward * step)
-          .addScaledVector(side, right * step);
-        move.y += up * step;
+        this._desired.addScaledVector(fwd, forward).addScaledVector(side, right);
+        this._desired.y += up;
+        if (this._desired.lengthSq() > 1e-6) this._desired.normalize().multiplyScalar(speed);
+      }
 
-        c.position.add(move);
-        target.add(move);
+      if (this.inertia) {
+        // 游览模式：起步缓动、松键后滑行（指数衰减），不硬停
+        const k =
+          this._desired.lengthSq() > 0
+            ? 1 - Math.exp(-dtClamped * 6.5)
+            : 1 - Math.exp(-dtClamped * 1.7);
+        this.velocity.lerp(this._desired, Math.min(1, Math.max(0.02, k)));
+        if (this._desired.lengthSq() === 0 && this.velocity.lengthSq() < 1) this.velocity.set(0, 0, 0);
+      } else {
+        this.velocity.copy(this._desired);
+      }
+
+      if (this.velocity.lengthSq() > 1e-6) {
+        this._move.copy(this.velocity).multiplyScalar(dtClamped);
+        c.position.add(this._move);
+        target.add(this._move);
 
         // 平移后把移动量投影回地表高度，保持观察点贴地
         const ground = this.hf.sampleWorld(target.x, target.z) * this.hf.reliefMeters * this.getExaggeration();
