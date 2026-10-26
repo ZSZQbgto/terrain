@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.vite/
+*.log
+.DS_Store
+
+# 地形资产（可由 npm run assets 从 resourses/ 的源图重建）
+public/data/

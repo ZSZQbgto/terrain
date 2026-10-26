@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>模型沙盘编辑器 · 尚庄炉水库 8 km 地形</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="labels" class="labels-layer"></div>
+    <div id="ui" class="mode-models">
+      <header id="toolbar"></header>
+      <aside id="panel-models" class="panel"></aside>
+      <aside id="panel-inspector" class="panel"></aside>
+      <aside id="panel-water" class="panel"></aside>
+      <aside id="panel-water-editor" class="panel"></aside>
+      <div id="hint"></div>
+    </div>
+    <div id="loading">
+      <div class="spinner"></div>
+      <div id="loading-text">初始化…</div>
+    </div>
+    <input id="file-input" type="file" accept=".glb,.gltf" multiple hidden />
+    <input id="project-input" type="file" accept=".json,application/json" hidden />
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

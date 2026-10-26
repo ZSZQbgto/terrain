@@ -1,0 +1,22 @@
+{
+  "name": "terrain-modeldesigner",
+  "private": true,
+  "version": "0.1.0",
+  "description": "地形沙盘模型编辑器：在 8 km DEM 地形上导入 glb 模型、实时编辑变换、加标签并导出工程",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "assets": "node scripts/prepare-assets.mjs",
+    "models:index": "node scripts/build-model-index.mjs",
+    "models:sample": "node scripts/make-sample-glb.mjs"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "sharp": "^0.35.5",
+    "vite": "^7.3.7"
+  }
+}
