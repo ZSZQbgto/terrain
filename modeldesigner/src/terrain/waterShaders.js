@@ -84,6 +84,8 @@ uniform vec3  uFogColor;
 uniform float uFogDensity;
 uniform float uHazeHeight;
 uniform float uOpacity;
+uniform sampler2D uNormalMap;  // 程序化波纹法线（带 mipmap，远处自动平滑）
+uniform float uNormalScale;
 
 varying vec2 vUv;
 varying vec3 vWorld;
@@ -93,34 +95,51 @@ void main() {
   bool isFlow = uFlow > 0.5;
   float t = uTime;
 
-  // 静止水面：世界坐标上的缓慢起伏；流动水：沿路径 v 方向滚动
-  float scroll = isFlow ? (vUv.y - t * uSpeed * 1.6) : (t * uSpeed);
-  vec2 p = vWorld.xz * 0.045;
+  // 采样坐标：
+  //   流动水 → UV（u = 横向、v = 沿程距离），相位只沿 v 推进 → 纹理顺水流线滚向终点
+  //   静止水面 → 世界坐标 xz，波纹随时间缓慢演化
+  vec2 base;
+  if (isFlow) {
+    base = vec2(vUv.x * 3.0, vUv.y * 0.85 - t * uSpeed * 0.5);
+  } else {
+    base = vWorld.xz * 0.011;
+  }
 
-  float w1 = valueNoise(p * 1.0 + vec2(scroll * 0.55, scroll * 0.35));
-  float w2 = valueNoise(p * 2.7 - vec2(scroll * 0.9, scroll * 0.7));
-  float w3 = valueNoise(p * 6.3 + vec2(scroll * 1.4, -scroll * 1.1));
+  // 两次不同尺度 / 不同速度的法线采样叠加：
+  // 近处是细碎波纹（不再是大色块），远处由 mipmap 自动降采样，不会闪烁成噪点。
+  vec2 uvA = base + vec2(t * 0.013, t * 0.008);
+  vec2 uvB = base * 2.35 - vec2(t * 0.019, -t * 0.012);
+  vec2 nA = texture2D(uNormalMap, uvA).xy * 2.0 - 1.0;
+  vec2 nB = texture2D(uNormalMap, uvB).xy * 2.0 - 1.0;
 
-  // 三层噪声扰动法线：波纹细节一致，静止/流动只是相位推进方式不同
-  vec3 n = normalize(vec3(
-    (w2 - 0.5) * 0.22 + (w3 - 0.5) * 0.09,
-    1.0,
-    (w3 - 0.5) * 0.20 + (w1 - 0.5) * 0.08
-  ));
+  // 远距离收敛波纹强度（双重保险：纹理已有 mipmap）
+  float distanceFade = 1.0 - smoothstep(2000.0, 6500.0, vViewDist);
+  float bump = uNormalScale * mix(0.32, 1.0, distanceFade);
+  vec2 nXZ = (nA + nB * 0.7) * bump * 0.5;
+  vec3 n = normalize(vec3(nXZ.x, 1.0, nXZ.y));
 
   vec3 viewDir = normalize(cameraPosition - vWorld);
   vec3 lightDir = normalize(uSunDir);
   vec3 halfDir = normalize(lightDir + viewDir);
 
-  // 菲涅尔：正视偏水体色，掠视偏天空色
-  float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 5.0);
-  vec3 col = mix(uWaterColor, uSkyColor, clamp(0.08 + fres * 0.72, 0.0, 0.86));
+  // Schlick 菲涅尔：正视看到水下散射色，掠视几乎全是天空反射
+  float NdV = max(dot(n, viewDir), 0.0);
+  float fresnel = pow(1.0 - NdV, 5.0);
+  float refl = clamp(0.05 + fresnel * 0.92, 0.0, 0.96);
 
-  // 日光反光：一层锐利的镜面 + 一层随波纹闪动的太阳辉光
+  vec3 body = uWaterColor * mix(1.24, 0.8, refl);       // 近处偏亮（浅水），远/斜偏深
+  vec3 skyRefl = mix(uSkyColor * 0.7, uSkyColor * 1.2, fresnel);
+  vec3 col = mix(body, skyRefl, refl);
+
+  // 日光反光：一个锐利的太阳镜面 + 一层较宽的高光
   float ndh = max(dot(n, halfDir), 0.0);
-  float specular = pow(ndh, 260.0);
-  float glitter = pow(ndh, 26.0) * clamp(w1 * 1.4, 0.0, 1.0);
-  col += uSunColor * (specular * 2.2 + glitter * 0.32);
+  float specTight = pow(ndh, 620.0);
+  float specBroad = pow(ndh, 46.0);
+  col += uSunColor * (specTight * 3.6 + specBroad * 0.22);
+
+  // 掠射角上的细碎水光（用第二层法线扰动，避免出现规则的条纹感）
+  float sparkle = smoothstep(0.72, 1.0, fresnel) * max(nB.x + nB.y, 0.0);
+  col += vec3(0.72, 0.85, 0.95) * sparkle * 0.12;
 
   // 流动水横向收边（区域恒为 1，靠多边形裁切）
   float edge = isFlow
@@ -143,13 +162,18 @@ void main() {
  * 所有环境 uniform 都直接引用 env 里的对象 —— 改 env.uFogDensity.value
  * （图形选项里的薄雾滑块）会同时作用到地形与水面。
  */
-export function makeWaterMaterial(env, { flow = false, opacity = 0.86, speed = 0.35, color } = {}) {
+export function makeWaterMaterial(
+  env,
+  { flow = false, opacity = 0.86, speed = 0.35, color, normalMap = null, normalScale = 0.9 } = {},
+) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
       uSpeed: { value: speed },
       uFlow: { value: flow ? 1 : 0 },
       uWaterColor: { value: new THREE.Color(color ?? (flow ? 0x17414f : 0x14404f)) },
+      uNormalMap: { value: normalMap },
+      uNormalScale: { value: normalScale },
       uSkyColor: env.uSkyColor,
       uSunDir: env.uSunDir,
       uSunColor: env.uSunColor,

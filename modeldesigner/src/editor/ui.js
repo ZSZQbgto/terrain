@@ -906,6 +906,7 @@ export class Ui {
     if (this._suppressWaterRender) return;
     this.renderWaterList();
     this.renderWaterInspector();
+    this.waterEditor?.syncNodes(); // 选中变化时同步场景里的可拖动节点
   }
 
   /** 菜单/开关按钮的文案与高亮 */

@@ -10,12 +10,15 @@
  */
 import * as THREE from 'three';
 import { makeWaterMaterial } from '../terrain/waterShaders.js';
+import { createWaterNormalTexture } from '../terrain/waterTextures.js';
 import { normalizeWater, uid } from './project.js';
 
 export class WaterSystem {
-  constructor({ scene, heightField, env, getSurfaceTargets }) {
+  constructor({ scene, heightField, env, getSurfaceTargets, maxAnisotropy = 8 }) {
     this.hf = heightField;
     this.env = env;
+    // 波纹法线贴图（静止水与流动水共享）：mipmap + 各向异性 → 近处细节细碎、远处不糊不闪
+    this.waterNormals = createWaterNormalTexture(256, maxAnisotropy);
     // 水带"贴到物体表面"用：返回模型 content 列表（glb 是真实几何，可 raycast）
     this.getSurfaceTargets = getSurfaceTargets ?? (() => []);
     this.raycaster = new THREE.Raycaster();
@@ -122,6 +125,29 @@ export class WaterSystem {
     return flow;
   }
 
+  /** 拖动静止水面的节点：只改水平位置，水面高度（level）保持不变 */
+  moveAreaPoint(id, index, x, z, commit = true) {
+    const area = this.state.areas.find((a) => a.id === id);
+    if (!area || !area.points[index]) return;
+    area.points[index] = [x, z];
+    this._rebuildArea(area);
+    if (commit) this._emit();
+  }
+
+  /** 拖动流动水的节点：x/y/z 都可改（该点自己的宽度与横向朝向保留） */
+  moveFlowPoint(id, index, x, y, z, commit = true) {
+    const flow = this.state.flows.find((f) => f.id === id);
+    if (!flow || !flow.points[index]) return;
+    flow.points[index] = { ...flow.points[index], x, y, z };
+    this._rebuildFlow(flow);
+    if (commit) this._emit();
+  }
+
+  /** 拖动结束：提交一次变更（进撤回栈 + 触发自动保存） */
+  commitChange() {
+    this._emit();
+  }
+
   updateFlow(id, patch) {
     const flow = this.state.flows.find((f) => f.id === id);
     if (!flow) return;
@@ -205,7 +231,13 @@ export class WaterSystem {
   // ── 渲染 ──────────────────────────────────────────────────────────────────
   /** 静止水面：与流动水同一套材质，只是 uFlow = 0（波纹随时间缓慢起伏） */
   _makeAreaMaterial() {
-    return makeWaterMaterial(this.env, { flow: false, opacity: 0.88, speed: 0.22 });
+    return makeWaterMaterial(this.env, {
+      flow: false,
+      opacity: 0.88,
+      speed: 0.22,
+      normalMap: this.waterNormals,
+      normalScale: 0.95,
+    });
   }
 
   /** 供水体绘制预览复用：生成一个带流动动画的水带材质 */
@@ -215,7 +247,13 @@ export class WaterSystem {
 
   /** 流动水：同一套材质，uFlow = 1（纹理沿路径滚动 + 横向收边） */
   _makeFlowMaterial() {
-    const material = makeWaterMaterial(this.env, { flow: true, opacity: 0.9, speed: 1 });
+    const material = makeWaterMaterial(this.env, {
+      flow: true,
+      opacity: 0.9,
+      speed: 1,
+      normalMap: this.waterNormals,
+      normalScale: 1.1,
+    });
     this.materials.add(material);
     return material;
   }

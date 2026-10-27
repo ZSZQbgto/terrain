@@ -79,8 +79,14 @@ export default function modelLibraryPlugin() {
     },
 
     async buildStart() {
-      const payload = await writeModelIndex();
-      this.info?.(`[models] 生成 public/models/index.json（${payload.files.length} 个模型）`);
+      // 写索引失败（Windows 文件锁 / 只读磁盘）不应该让 dev 或构建整体失败：
+      // 资源列表在运行时会退回扫描 public/models。
+      try {
+        const payload = await writeModelIndex();
+        this.info?.(`[models] 生成 public/models/index.json（${payload.files.length} 个模型）`);
+      } catch (err) {
+        this.warn?.(`[models] 写 index.json 失败，已跳过：${err?.message ?? err}`);
+      }
     },
   };
 }

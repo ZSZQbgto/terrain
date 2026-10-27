@@ -153,6 +153,8 @@ async function main() {
     env,
     // 流动水带贴表面用：模型 content 列表（地形靠 CPU 高度采样兜底）
     getSurfaceTargets: () => getModelTargets(),
+    // 水面法线贴图用各向异性过滤：斜视角不糊、远处不闪
+    maxAnisotropy: renderer.capabilities.getMaxAnisotropy(),
   });
   waterSystem.setDefaultLevel(DEFAULT_WATER_LEVEL);
 

@@ -43,6 +43,17 @@ export class WaterEditor {
     this.markerMaterial = new THREE.MeshBasicMaterial({ color: 0xffd166, depthTest: false });
     this._previewMaterials = []; // 需要随预览一起释放的材质（流动水带）
 
+    // 选中水体的可拖动节点（青色小球 + 序号）
+    this.nodes = new THREE.Group();
+    this.nodes.name = 'water-nodes';
+    scene.add(this.nodes);
+    this.nodeMeshes = [];
+    this.nodeMaterial = new THREE.MeshBasicMaterial({ color: 0x7fe6d4, depthTest: false });
+    this.nodeHoverMaterial = new THREE.MeshBasicMaterial({ color: 0xf2fbff, depthTest: false });
+    this.nodeRaycaster = new THREE.Raycaster();
+    this._drag = null; // { kind, id, index, plane }
+    this._plane = new THREE.Plane();
+
     this._bind();
   }
 
@@ -178,12 +189,29 @@ export class WaterEditor {
   }
 
   _bind() {
+    // 非绘制状态下：点住选中水体的节点即可拖动
     this.dom.addEventListener('pointerdown', (event) => {
-      if (!this.drawing || event.button !== 0) return;
+      if (event.button !== 0) return;
+      if (!this.drawing) {
+        const hit = this._pickNode(event.clientX, event.clientY);
+        if (hit) {
+          this._startNodeDrag(hit);
+          return;
+        }
+      }
+      if (!this.drawing) return;
       this._down = { x: event.clientX, y: event.clientY };
     });
 
+    this.dom.addEventListener('pointermove', (event) => {
+      if (this._drag) this._dragMove(event);
+    });
+
     this.dom.addEventListener('pointerup', (event) => {
+      if (this._drag) {
+        this._endNodeDrag();
+        return;
+      }
       if (!this.drawing || event.button !== 0 || !this._down) return;
       const dx = event.clientX - this._down.x;
       const dy = event.clientY - this._down.y;
@@ -216,6 +244,122 @@ export class WaterEditor {
     const hit = this.cameraControls?.pick?.(clientX, clientY);
     if (!hit) return null;
     return new THREE.Vector3(hit.x, hit.y, hit.z);
+  }
+
+  // ── 选中水体的节点：显示 + 拖动 ───────────────────────────────────────────
+  /** 节点世界坐标：静止水面画在水平面上，流动水画在点自己的空间位置上 */
+  _nodeWorldPosition(kind, id, index) {
+    if (kind === 'area') {
+      const area = this.system.state.areas.find((a) => a.id === id);
+      const p = area?.points[index];
+      if (!p) return null;
+      return new THREE.Vector3(p[0], this.system.metersToWorldY(area.level) + 4, p[1]);
+    }
+    const flow = this.system.state.flows.find((f) => f.id === id);
+    const p = flow?.points[index];
+    if (!p) return null;
+    return new THREE.Vector3(p.x, p.y + 4, p.z);
+  }
+
+  /** 与当前选中同步：给选中的水体画一排可拖动节点 */
+  syncNodes() {
+    this._clearNodes();
+    const sel = this.system.selected;
+    const item = this.system.selectedItem;
+    if (!sel || !item) return;
+    item.points.forEach((_, index) => {
+      const position = this._nodeWorldPosition(sel.kind, sel.id, index);
+      if (!position) return;
+      const marker = new THREE.Mesh(this.markerGeometry, this.nodeMaterial);
+      marker.position.copy(position);
+      marker.renderOrder = 30;
+      marker.userData = { nodeKind: sel.kind, nodeId: sel.id, nodeIndex: index };
+      // 序号挂成子对象，节点移动时自动跟随
+      const el = document.createElement('div');
+      el.className = 'pick-index';
+      el.textContent = String(index + 1);
+      const label = new CSS2DObject(el);
+      label.position.set(0, 20, 0);
+      marker.add(label);
+      this.nodes.add(marker);
+      this.nodeMeshes.push(marker);
+    });
+  }
+
+  _clearNodes() {
+    for (const marker of [...this.nodes.children]) {
+      this.nodes.remove(marker);
+      for (const child of marker.children) child.element?.remove?.();
+    }
+    this.nodeMeshes.length = 0;
+  }
+
+  _pickNode(clientX, clientY) {
+    if (!this.nodeMeshes.length) return null;
+    const rect = this.dom.getBoundingClientRect();
+    this.nodeRaycaster.setFromCamera(
+      new THREE.Vector2(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -(((clientY - rect.top) / rect.height) * 2 - 1),
+      ),
+      this.camera,
+    );
+    const hits = this.nodeRaycaster.intersectObjects(this.nodeMeshes, false);
+    return hits[0] ?? null;
+  }
+
+  _startNodeDrag(hit) {
+    const { nodeKind: kind, nodeId: id, nodeIndex: index } = hit.object.userData;
+    if (kind === 'area') {
+      // 静止水面：在水平面内拖动 → 水平位置可变，水面高度保持不变
+      const area = this.system.state.areas.find((a) => a.id === id);
+      const surfaceY = this.system.metersToWorldY(area.level);
+      this._plane.setFromNormalAndCoplanarPoint(
+        new THREE.Vector3(0, 1, 0),
+        new THREE.Vector3(0, surfaceY, 0),
+      );
+    } else {
+      // 流动水：在过该点、朝向相机的平面内拖动 → 空间位置（x/y/z）都可改
+      const normal = new THREE.Vector3();
+      this.camera.getWorldDirection(normal).negate();
+      this._plane.setFromNormalAndCoplanarPoint(normal, hit.object.position.clone());
+    }
+    this._drag = { kind, id, index };
+    this.cameraControls?.setEnabled(false); // 拖节点时不要同时转视角
+    this.editor.setPickingEnabled(false);
+    this.onStatus?.(
+      kind === 'area' ? '拖动节点改水平位置（水面高度不变）· 松开提交' : '拖动节点改空间位置 · 松开提交',
+    );
+  }
+
+  _dragMove(event) {
+    const drag = this._drag;
+    if (!drag) return;
+    const rect = this.dom.getBoundingClientRect();
+    this.nodeRaycaster.setFromCamera(
+      new THREE.Vector2(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -(((event.clientY - rect.top) / rect.height) * 2 - 1),
+      ),
+      this.camera,
+    );
+    const point = new THREE.Vector3();
+    if (!this.nodeRaycaster.ray.intersectPlane(this._plane, point)) return;
+    if (drag.kind === 'area') {
+      this.system.moveAreaPoint(drag.id, drag.index, point.x, point.z, false);
+    } else {
+      this.system.moveFlowPoint(drag.id, drag.index, point.x, point.y, point.z, false);
+    }
+    this.syncNodes(); // 节点与序号跟着走
+  }
+
+  _endNodeDrag() {
+    if (!this._drag) return;
+    this._drag = null;
+    this.cameraControls?.setEnabled(true);
+    this.editor.setPickingEnabled(true);
+    this.system.commitChange(); // 一次变更：进撤回栈 + 触发自动保存
+    this.onStatus?.(null);
   }
 
   _clearPreview() {
