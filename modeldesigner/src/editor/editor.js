@@ -45,8 +45,8 @@ export class Editor extends EventTarget {
     this.selectedPartPath = null;
     this.showTags = true;
     this.texturesEnabled = true; // 全局贴图开关（物体侧；地形侧由 main 统一调度）
-    this.pickingEnabled = true; // 绘制水面时临时关闭模型拾取
-    this.waterSystem = null; // 由 main 注入，用于选中互斥与工程序列化
+    this.pickingEnabled = true; // 放置水源时临时关闭模型拾取
+    this.water = null; // 由 main 注入 FluidWater 实例（选中互斥 + 工程序列化）
     this.missingAssets = [];
     this.raycaster = new THREE.Raycaster();
     this._saveTimer = 0;
@@ -203,7 +203,7 @@ export class Editor extends EventTarget {
     const model = this.models.find((m) => m.id === modelId) ?? null;
     this.selectedId = model ? model.id : null;
     this.selectedPartPath = partPath && partPath.length ? [...partPath] : null;
-    this.waterSystem?.clearSelection(); // 模型与水体选中互斥
+    this.water?.selectSource(null); // 模型与水源选中互斥
     this.attachGizmo();
     this.emitChange();
   }
@@ -211,17 +211,17 @@ export class Editor extends EventTarget {
   clearSelection() {
     this.selectedId = null;
     this.selectedPartPath = null;
-    this.waterSystem?.clearSelection();
+    this.water?.selectSource(null);
     this.gizmo.detach();
     this.emitChange();
   }
 
-  /** 注入水面系统（选中互斥 + 工程序列化） */
-  attachWater(system) {
-    this.waterSystem = system;
+  /** 注入水体模拟系统（FluidWater：选中互斥 + 工程序列化） */
+  attachWater(water) {
+    this.water = water;
   }
 
-  /** 绘制水面 / 拖 gizmo 时临时关闭模型拾取 */
+  /** 放置水源 / 拖 gizmo 时临时关闭模型拾取 */
   setPickingEnabled(on) {
     this.pickingEnabled = Boolean(on);
   }
@@ -537,7 +537,7 @@ export class Editor extends EventTarget {
 
   // ── 工程序列化 / 恢复 ─────────────────────────────────────────────────────
   serialize() {
-    return serializeProject(this.models, this.waterSystem?.toJSON() ?? null);
+    return serializeProject(this.models, this.water?.toJSON() ?? null);
   }
 
   scheduleSave() {
@@ -553,7 +553,9 @@ export class Editor extends EventTarget {
 
   async restore() {
     const stored = loadStoredProject();
-    if (!stored || !stored.models.length) return { restored: 0, missing: [] };
+    // 注意：没有模型也要恢复 —— 水体模拟是独立于模型的数据（水源 + 模拟参数），
+    // 只有水源、没有 glb 的工程同样要能刷新后恢复。
+    if (!stored) return { restored: 0, missing: [] };
     return this.applyProject(stored);
   }
 
@@ -628,7 +630,7 @@ export class Editor extends EventTarget {
     }
 
     this.missingAssets = missing;
-    this.waterSystem?.load(project.water); // 水面区域 / 流动水一并恢复
+    this.water?.load(project.water); // 水源与模拟参数一并恢复
     this.attachGizmo();
     this.emitChange();
     this.scheduleSave(); // 导入工程后立即落盘，避免刷新丢失
@@ -651,7 +653,7 @@ export class Editor extends EventTarget {
   async resetAll() {
     this.clearAll();
     this.tagLayer.clear();
-    this.waterSystem?.load(null);
+    this.water?.load(null);
     clearStoredProject();
     this.emitChange();
   }
@@ -712,34 +714,13 @@ export class Editor extends EventTarget {
       this._pointerDown = null;
       if (Math.hypot(dx, dy) > 6) return; // 拖拽视角，不算点击
       if (this.gizmo.dragging) return;
-      if (!this.pickingEnabled) return; // 正在绘制水面：点击归绘制逻辑
+      if (!this.pickingEnabled) return; // 放置水源 / 拖水源标记时点击归 WaterEditor 处理
 
-      // 水体与模型一起参与拾取，取离相机更近的那个
-      const waterHit = this.pickWater(event.clientX, event.clientY);
+      // 只拾取模型；水源标记的点击/拖动由 WaterEditor 自己管理
       const modelHit = this.pick(event.clientX, event.clientY);
-      const waterDist = waterHit?.point ? this.camera.position.distanceTo(waterHit.point) : Infinity;
-      const modelDist = modelHit?.point ? this.camera.position.distanceTo(modelHit.point) : Infinity;
-
-      if (waterHit && waterDist <= modelDist) {
-        this.clearSelection();
-        this.waterSystem.select({ kind: waterHit.kind, id: waterHit.id });
-        return;
-      }
       if (modelHit?.model) this.select(modelHit.model.id); // 场景点击只选整体，不选部件
       else this.clearSelection();
     });
-  }
-
-  /** 拾取水体（区域 / 流动水）；与模型拾取一起比较距离决定选中谁 */
-  pickWater(clientX, clientY) {
-    if (!this.waterSystem) return null;
-    const rect = this.domElement.getBoundingClientRect();
-    const ndc = new THREE.Vector2(
-      ((clientX - rect.left) / rect.width) * 2 - 1,
-      -(((clientY - rect.top) / rect.height) * 2 - 1),
-    );
-    this.raycaster.setFromCamera(ndc, this.camera);
-    return this.waterSystem.raycast(this.raycaster);
   }
 
   pick(clientX, clientY) {

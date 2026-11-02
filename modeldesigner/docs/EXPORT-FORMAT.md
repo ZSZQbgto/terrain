@@ -1,7 +1,7 @@
 # 导出格式说明（工程 JSON v1）
 
-本文档描述**当前实现**（`src/editor/project.js` + `src/editor/editor.js`）导出的工程文件结构，
-以及每个字段如何映射到 3D 场景。改字段时请同步更新这里。
+本文档描述**当前实现**（`src/editor/project.js` + `src/editor/editor.js` + `src/water/waterState.js`）
+导出的工程文件结构，以及每个字段如何映射到 3D 场景。改字段时请同步更新这里。
 
 ## 1. 导出的两种模式
 
@@ -18,6 +18,7 @@
 {
   "version": 1,
   "savedAt": 1730000000000,
+  "water": { /* 见第 9 节 */ },
   "models": [ /* 见第 3 节 */ ],
   "embeddedAssets": {
     "models/pump.glb": { "name": "pump.glb", "base64": "Z2xURgIAAAA..." }
@@ -29,8 +30,9 @@
 | --- | --- | --- |
 | `version` | number | 当前恒为 `1`。导入时不做版本升级变换，未知字段忽略 |
 | `savedAt` | number | 导出时刻（`Date.now()`） |
+| `water` | object | 水体模拟状态（水源 + 模拟/外观参数），见第 9 节 |
 | `models` | array | 场景里的模型实例，顺序无意义（渲染按 `id` 匹配） |
-| `embeddedAssets` | object | **仅内嵌模式**。键 = `asset.url`（文件夹资源）或 `asset.id`（本地暂存） |
+| `embeddedAssets` | object | **仅内嵌模式**。键 = `asset.url`（文件夹资源）或 `asset.id`（本地暂存）；`water` 与它无关 |
 
 ## 3. 模型实例 `models[]`
 
@@ -139,7 +141,8 @@ worldY     = normalized × reliefMeters × exaggeration
 ```
 THREE.Scene
 ├── terrain.group       地形分块 LOD（自定义 ShaderMaterial，含日间薄雾/边界雾）
-├── sky / water         天空球、水面
+├── sky                 天空球
+├── water.group         水体模拟：覆盖全域的水面网格（水源标记仅水体编辑模式显示，不进工程）
 └── model.root          ← transform（第 3.2 节）作用于这里
     └── model.content   ← gltf.scene 克隆；partTransforms / labels.nodePath 相对它定位
         ├── children[0] …       ← path[0]
@@ -155,6 +158,9 @@ THREE.Scene
   平移 `root.position.y` 使 `box.min.y` 落在地表高度
 - **雾/光照**：模型用 three 标准 PBR 材质，`scene.fog = FogExp2(uFogColor, uFogDensity)`，
   颜色与密度取自地形的 `createEnvUniforms()`，因此远处模型与地形同色淡化
+- **水体渲染**：`FluidWater`（`src/water/fluidWater.js`）读取同一份 `heightField.texture` 做
+  GPU 浅水模拟；水面网格按模拟水位位移，雾 / 天空 / 太阳 uniform 与地形共用。工程里只存
+  水源与参数，**不存当前水位**
 - **标签渲染**：每个标签一个 `CSS2DObject`，挂在目标节点（或 `content` 根）上，
   由 `CSS2DRenderer` 叠加在 canvas 之上
 
@@ -162,60 +168,55 @@ THREE.Scene
 
 | 存储 | 内容 | 键 |
 | --- | --- | --- |
-| `localStorage` | 引用模式工程 JSON（不含 glb） | `modeldesigner.project.v1` |
-| `localStorage` | 视图设置（贴图 / 碰撞 / 水面 / 标签显示 / 薄雾强度 / 界面模式，不属于工程） | `modeldesigner.settings.v1` |
+| `localStorage` | 引用模式工程 JSON（不含 glb；含 `water`） | `modeldesigner.project.v1` |
+| `localStorage` | 视图设置（贴图 / 碰撞 / 水体开关 / 标签显示 / 薄雾强度 / 界面模式，不属于工程） | `modeldesigner.settings.v1` |
 | IndexedDB | glb 字节（`source: "local"` 的资源） | 库 `terrain-modeldesigner` / store `assets`、`meta` |
 
 全局贴图开关（地形卫星瓦片 / 模型自带 `map`）属于视图状态，不写进工程 JSON，
 所以换一份工程时不会被它影响；它只影响渲染，不改变任何 transform 或标签数据。
 
-任何编辑（变换、改名、增删模型/标签）都会在 400 ms 后自动保存；刷新页面时：
+任何编辑（变换、改名、增删模型/标签、增删水源、调水体参数）都会在 400 ms 后自动保存；刷新页面时：
 读 `localStorage` → 逐个按 `asset` 取字节 → `GLTFLoader.parseAsync` → 先应用 `partTransforms`
-再应用 `transform`。资源取不到的模型会被跳过，并在界面提示「N 个资源缺失」。
+再应用 `transform`，最后把 `water` 交给 `FluidWater.load()`（按保存的水源与参数重新开始模拟）。
+资源取不到的模型会被跳过，并在界面提示「N 个资源缺失」。
 
 ## 7. 导入工程的容错
 
 `normalizeProject()` 会：丢弃缺少 `asset` 的条目、补齐缺失的 `transform`/`labels` 成分、
 把缺失/非法的 `kind` 归到默认的 `static`、把非数组 `nodePath` 归到 `null`、
 丢弃标签上的非标准字段（如旧的 `note` / `motion`）、为缺失 id 生成新 id。
+`water` 由 `normalizeWaterState()` 归一化：缺失字段补默认、非法坐标的水源丢弃、
+`targetLevel` / `amount` 非法值归 `null`、数值夹到合法范围。
 因此手写或旧版本 JSON 一般也能导入。
 
 ## 8. 尚未包含（避免误用）
 
 - **不导出 glb**：编辑结果（缩放/旋转/部件微调）只存在于工程 JSON，没有把变换烘回模型文件
 - **不导出图片/缩略图**
+- **不保存当前水位/流量**：`water` 只存水源与模拟参数，导入后从干地重新模拟
 - **标签不驱动任何逻辑**：它只是名称 + 类型 + 挂载点，不做动画、条件或业务联动
 - **`.gltf`（文本）** 若引用外部 `.bin` / 贴图，单独导入会缺资源；请优先用单文件 `.glb`
 
-## 9. 水面 `water`
+## 9. 水体 `water`
 
-水面没有"统一大平面"，只有圈定区域与流动水：
+水体由 GPU 浅水模拟生成（`src/water/fluidWater.js`），没有可圈定的水面对象；
+`water` 的形状与运行时 `FluidWater.state`、`waterState.js` 的归一化结果完全一致：
 
 ```json
 {
   "enabled": true,
-  "level": 69,
-  "areas": [
+  "sim": { "speed": 1, "waterAmount": 15, "resolution": 768, "paused": false },
+  "visual": { "shimmer": 1, "ripple": 1, "clarity": 0.62 },
+  "sources": [
     {
-      "id": "area_xxx",
-      "name": "水面区域 1",
-      "level": 86.38,
-      "points": [[-800, -620], [620, -520], [840, 180], [320, 780], [-720, 660]],
-      "labels": [{ "id": "wlabel_xxx", "title": "库区水面" }]
-    }
-  ],
-  "flows": [
-    {
-      "id": "flow_xxx",
-      "name": "流动水 1",
-      "speed": 1.6,
-      "width": 26,
-      "points": [
-        { "x": -300, "y": 120.5, "z": -1600, "width": 70, "dir": 0 },
-        { "x": -260, "y": 118.2, "z": -1200, "width": null, "dir": null },
-        { "x": -190, "y": 112.0, "z": -900, "width": 4, "dir": 15 }
-      ],
-      "labels": []
+      "id": "wsrc_m4x2k_1_ab3cd",
+      "name": "水源 1",
+      "x": -820.4,
+      "z": 640.2,
+      "radius": 150,
+      "targetLevel": 86.4,
+      "amount": null,
+      "enabled": true
     }
   ]
 }
@@ -223,17 +224,36 @@ THREE.Scene
 
 | 字段 | 说明 |
 | --- | --- |
-| `enabled` | 水面总开关（工具栏按钮，同时也写视图设置） |
-| `level` | **新建区域**的默认水面高程（米），默认 69 |
-| `areas[].points` | 世界 **x/z**（米），只存平面坐标；≥3 点 |
-| `areas[].level` | 该区域水平面高程（米）—— 绘制时取各选点地表高程的平均值，之后可手动微调 |
-| `flows[].points` | 关键点数组，≥2 点，用 Catmull-Rom 平滑成曲线。每点 `{ x, y, z, width, dir }`（也兼容旧的 `[x, y, z]`）：`width` 为该点水带宽度（`null` = 跟随 `flows[].width`），`dir` 为该点横向朝向角度（`null` = 自动，按「切线 × 表面法线」） |
-| `flows[].points[].width / dir` | 逐点宽度（米）/ 横向朝向（度）；生成几何时沿曲线在相邻关键点之间线性插值 |
-| 水带贴合 | 采样点先投射到模型几何（raycast），未命中再用地形 CPU 高度；因此水贴图覆盖在物体贴图之上 |
-| `flows[].speed` | 水贴图沿路径滚动的速度倍率（`update` 里驱动 `uSpeed`） |
-| `flows[].width` | 水带宽度（米） |
-| `areas[].labels` / `flows[].labels` | **水体标签**：只有 `title`，不进场景 CSS2D，与物体标签分离 |
+| `enabled` | 水体总开关（工具栏「水面：开 / 关」，同时也写视图设置）。关闭后不渲染水面、也不推进模拟 |
+| `sim.speed` | 模拟速度倍率 0.1–4，默认 1（1× = 60 Hz 下每帧 1 个子步；单帧最多 4 步） |
+| `sim.waterAmount` | 每次注水量（米），1–300，默认 15；单个水源可用 `sources[].amount` 覆盖 |
+| `sim.resolution` | 模拟分辨率 256 / 512 / 768 / 1024，默认 768；非这四档的值归到最接近的一档 |
+| `sim.paused` | 是否暂停模拟，默认 `false`（暂停时仍显示当前水面） |
+| `visual.shimmer` | 太阳高光强度 0–3，默认 1 |
+| `visual.ripple` | 波纹强度 0–2，默认 1 |
+| `visual.clarity` | 水体清澈度 0–1，默认 0.62（0 浑浊、1 通透） |
+| `sources` | 水源数组，最多 8 个；缺省为空数组（没有水源时模拟保持干地） |
+| `sources[].id` | 水源 id（`wsrc_…`）；缺失时自动生成 |
+| `sources[].name` | 名称，默认「水源 N」；也显示在场景的 CSS2D 名称里 |
+| `sources[].x` / `.z` | 世界坐标（米，地形中心为原点）。坐标非数字的水源在导入时被丢弃 |
+| `sources[].radius` | 注水半径（米），默认 150。数据层接受 20–3000（面板滑块 20–2000） |
+| `sources[].targetLevel` | 目标水面**绝对高程**（米）；`null` = 不限制。面板上 0 或留空会写成 `null` |
+| `sources[].amount` | 该水源每次注水的水深（米，0.5–300）；`null` = 跟随 `sim.waterAmount` |
+| `sources[].enabled` | 是否启用，默认 `true`；停用的水源不注水、也不参与全局水位上限 |
 
-高程换算与模型一致：`worldY = (meters − elevation.minMeters) × 垂直夸张`。
+### 9.1 运行时推导：全局水位上限
 
-> 导入旧工程（没有 `water` 字段）时按空水面处理；非法点（数量不足/坐标非数字）会被丢弃。
+`uTargetCap` 不写进 JSON，而是每次状态变化时由 `sources` 推导：
+
+- 取所有**启用**且 `targetLevel != null` 的水源的**最高** `targetLevel`
+- 只要有任一启用水源 `targetLevel == null`（不限制），就没有上限
+- 水面超过上限的水被排掉（相当于溢洪道），避免多水源把整张地图无限灌高
+
+### 9.2 坐标与恢复行为
+
+- 数据里一律用「米」/ 世界坐标，与模型一致；渲染时换算世界高度：
+  `worldY = (meters − elevation.minMeters) × 垂直夸张`
+- 恢复工程时 `FluidWater.load()` 会复位模拟：**不保存当前水位**，
+  而是按保存的水源与参数从干地重新注水；`resolution` 变化会重建全部模拟缓冲
+- 导入旧工程（没有 `water` 字段）按默认水体处理（`enabled: true`、无水源）；
+  旧的 `areas` / `flows` 字段直接丢弃，不迁移

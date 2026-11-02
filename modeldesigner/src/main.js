@@ -24,7 +24,7 @@ import { TagLayer } from './editor/labels.js';
 import { Gizmo } from './editor/gizmo.js';
 import { Editor } from './editor/editor.js';
 import { Ui } from './editor/ui.js';
-import { WaterSystem } from './editor/waterSystem.js';
+import { FluidWater } from './water/fluidWater.js';
 import { WaterEditor } from './editor/waterEditor.js';
 
 const DATA = `${import.meta.env.BASE_URL}data/`;
@@ -137,26 +137,29 @@ async function main() {
     console.info('[satellite] 未找到 public/data/sat 瓦片 → 地形贴图不可用（放卫星源图后执行 npm run assets）');
   }
 
-  const sky = createSky(env, {
+  // 天空与水面的反射用同一份天色，避免“水面反射的天空”和背景天空不是一个颜色
+  const SKY_COLORS = {
     zenith: new THREE.Color(0x2f5f9e),
     horizon: new THREE.Color(0xb9cfe0),
-  });
+  };
+  const sky = createSky(env, SKY_COLORS);
   scene.add(sky);
 
   const relief = heightField.reliefMeters;
-  // 水面：只保留圈定区域与流动水，不再有覆盖全图的统一水面
-  const DEFAULT_WATER_LEVEL = 69; // 新建区域时的默认水面高程（米）
-  let getModelTargets = () => [];
-  const waterSystem = new WaterSystem({
-    scene,
+
+  // ── 水体模拟（GPU 浅水模拟，模拟域自动覆盖整个地形）─────────────────────
+  // 无需手动创建高度图 / 设定模拟范围：高度场直接取现有地形数据，
+  // 水面网格覆盖整个 8 km 地形，直接在地形上点选放置水源即可开始注水。
+  const water = new FluidWater({
+    renderer,
     heightField,
     env,
-    // 流动水带贴表面用：模型 content 列表（地形靠 CPU 高度采样兜底）
-    getSurfaceTargets: () => getModelTargets(),
-    // 水面法线贴图用各向异性过滤：斜视角不糊、远处不闪
+    skyColors: SKY_COLORS,
+    // 水面波纹法线用各向异性过滤：斜视角不糊、远处不闪
     maxAnisotropy: renderer.capabilities.getMaxAnisotropy(),
+    resolution: 768,
   });
-  waterSystem.setDefaultLevel(DEFAULT_WATER_LEVEL);
+  scene.add(water.group);
 
   const cameraControls = new TerrainControls(camera, renderer.domElement, heightField, {
     getExaggeration: () => env.uExaggeration.value,
@@ -234,7 +237,7 @@ async function main() {
 
   const applyWater = (on) => {
     waterOn = Boolean(on);
-    waterSystem.setEnabled(waterOn);
+    water.setEnabled(waterOn);
     ui?.setWaterState(waterOn);
     patchSettings({ water: waterOn });
   };
@@ -248,16 +251,15 @@ async function main() {
     patchSettings({ fog: k });
   };
 
-  // 水面系统与编辑器打通：选中互斥 + 数据变化自动落盘/刷新面板
-  getModelTargets = () => editor.models.map((m) => m.content); // 水带贴表面用
-  editor.attachWater(waterSystem);
-  waterSystem.onChange = () => {
+  // 水体模拟与编辑器打通：选中互斥 + 数据变化自动落盘/刷新面板
+  editor.attachWater(water);
+  water.onChange = () => {
     editor.scheduleSave();
     ui?.refreshWaterPanel();
   };
 
   const waterEditor = new WaterEditor({
-    system: waterSystem,
+    water,
     editor,
     camera,
     domElement: renderer.domElement,
@@ -274,7 +276,7 @@ async function main() {
     editor,
     library,
     gizmo,
-    waterSystem,
+    water,
     waterEditor,
     onImportFiles: () => fileInput.click(),
     onImportProject: () => projectInput.click(),
@@ -282,25 +284,17 @@ async function main() {
     onToggleTextures: () => applyTextures(!texturesOn),
     onToggleCollision: () => applyCollision(!collisionOn),
     onToggleWater: () => applyWater(!waterOn),
-    onDrawArea: () => waterEditor.start('area'),
-    onDrawFlow: () => waterEditor.start('flow'),
     onMode: (mode) => patchSettings({ uiMode: mode }),
     onFogChange: (scale) => applyFog(scale),
     onToggleTour: () => applyTour(!tourOn),
-    onWaterUndoPoint: () => waterEditor.undoPoint(),
-    onWaterFinish: () => waterEditor.finish(),
-    onWaterCancel: () => waterEditor.cancel(),
-    onWaterRedraw: () => {
-      const sel = waterSystem.selected;
-      if (!sel) {
-        ui?.toast('请先从水体列表选中一个对象');
-        return;
-      }
-      waterEditor.redraw(sel.kind, sel.id);
-    },
+    onWaterAddSource: () => waterEditor.startPlacement(),
     onWaterSave: () => {
       editor.saveNow();
-      ui?.toast('水体编辑已保存到本地工程');
+      ui?.toast('水体模拟已保存到本地工程');
+    },
+    onWaterReset: () => {
+      water.reset();
+      ui?.toast('已重置水体（清空所有积水）');
     },
     onReset: async () => {
       await editor.resetAll();
@@ -319,6 +313,7 @@ async function main() {
     if (next && waterEditor.active) waterEditor.cancel(); // 别把正在画的点带进游览
     tourOn = next;
     ui?.setTourState(tourOn);
+    waterEditor.setTourHidden(tourOn); // 游览模式隐藏水源标记（小球 / 圆环）
     cameraControls.setInertia(tourOn);
     if (tourOn) {
       ui?.toast('游览模式：拖动旋转 · 滚轮缩放 · WASD 平移（带惯性）· Esc 退出');
@@ -478,7 +473,7 @@ async function main() {
   const loop = () => {
     const dt = Math.min(clock.getDelta(), 0.25);
     cameraControls.update(dt);
-    waterSystem.update(clock.elapsedTime); // 流动水贴图滚动
+    water.update(dt); // GPU 浅水模拟：按模拟速度推进子步（水面网格在场景里透明渲染）
     sky.position.copy(camera.position);
     terrain.updateLOD(camera, window.innerHeight);
     satellite?.update(camera); // 地形贴图：按块到相机距离切换三档瓦片
@@ -505,7 +500,7 @@ async function main() {
     terrain,
     heightField,
     env,
-    waterSystem,
+    water,
     waterEditor,
     editor,
     ui,
@@ -517,6 +512,7 @@ async function main() {
     satellite,
     applyTour,
     applyTextures,
+    applyWater,
     isTexturesOn: () => texturesOn,
   };
 }

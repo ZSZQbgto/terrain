@@ -22,12 +22,30 @@ const fmtSize = (bytes) => {
 const DEFAULT_HINT =
   '拖入 .glb 或点「导入模型」 · 左键选择模型 · 1/2/3 切换移动/旋转/缩放 · Esc 取消选择 · Delete 删除 · Ctrl+D 复制';
 
+/** 水体编辑模式的默认提示（与模型编辑的提示分开，避免模式切换后提示串味） */
+const WATER_HINT =
+  '点「＋水源」在地形上放置水源（可连续放）· 拖动水源小球改位置 · 左侧列表选中后可改半径/目标水位/名称 · Esc 结束放置';
+
+/** 水体面板的兜底默认值（正常情况下直接用 water.state 里的值） */
+const WATER_SIM_FALLBACK = { speed: 1, waterAmount: 15, resolution: 768, paused: false };
+const WATER_VISUAL_FALLBACK = { shimmer: 1, ripple: 1, clarity: 0.62 };
+const WATER_RESOLUTIONS = [256, 512, 768, 1024];
+
+/** 目标水面高程输入：空 / 0 → null（不限制） */
+function parseTargetLevel(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  const value = Number(text);
+  if (!Number.isFinite(value) || value === 0) return null;
+  return value;
+}
+
 export class Ui {
   constructor({
     editor,
     library,
     gizmo,
-    waterSystem,
+    water,
     waterEditor,
     onImportFiles,
     onImportProject,
@@ -36,14 +54,9 @@ export class Ui {
     onToggleTextures,
     onToggleCollision,
     onToggleWater,
-    onDrawArea,
-    onDrawFlow,
-    onWaterUndo,
-    onWaterRedraw,
+    onWaterAddSource,
     onWaterSave,
-    onWaterUndoPoint,
-    onWaterFinish,
-    onWaterCancel,
+    onWaterReset,
     onFogChange,
     onToggleTour,
     onMode,
@@ -51,7 +64,7 @@ export class Ui {
     this.editor = editor;
     this.library = library;
     this.gizmo = gizmo;
-    this.waterSystem = waterSystem ?? null;
+    this.water = water ?? null;
     this.waterEditor = waterEditor ?? null;
     this.onImportFiles = onImportFiles;
     this.onImportProject = onImportProject;
@@ -60,18 +73,14 @@ export class Ui {
     this.onToggleTextures = onToggleTextures;
     this.onToggleCollision = onToggleCollision;
     this.onToggleWater = onToggleWater;
-    this.onDrawArea = onDrawArea;
-    this.onDrawFlow = onDrawFlow;
-    this.onWaterUndo = onWaterUndo;
-    this.onWaterRedraw = onWaterRedraw;
+    this.onWaterAddSource = onWaterAddSource;
     this.onWaterSave = onWaterSave;
-    this.onWaterUndoPoint = onWaterUndoPoint;
-    this.onWaterFinish = onWaterFinish;
-    this.onWaterCancel = onWaterCancel;
+    this.onWaterReset = onWaterReset;
     this.onFogChange = onFogChange;
     this.onToggleTour = onToggleTour;
     this.onMode = onMode;
     this.mode = 'models';
+    this._suppressWaterRender = false; // 拖滑杆时避免 water.onChange → 面板重建
 
     this.toolbar = document.getElementById('toolbar');
     this.modelsPanel = document.getElementById('panel-models');
@@ -152,18 +161,18 @@ export class Ui {
       <div class="panel-scroll"><div id="inspector-body"></div></div>
     `;
 
-    // 水体模式：左 = 水体对象列表，右 = 选中对象的编辑面板（与模型模式对称）
+    // 水体模式：左 = 水源列表，右 = 模拟参数 / 选中水源 / 外观（与模型模式对称）
     this.waterPanelEl.innerHTML = `
       <div class="panel-head">
-        <span>水体对象</span>
-        <span class="count" id="water-count">0 个</span>
+        <span>水体模拟</span>
+        <span class="count" id="water-count">0 个水源</span>
       </div>
       <div class="panel-scroll">
         <div class="row" style="padding:8px 10px 2px;gap:6px">
-          <button class="btn small primary" data-act="draw-area"
-                  title="在地形上点选围出水面区域，双击完成">＋水面区域</button>
-          <button class="btn small primary" data-act="draw-flow"
-                  title="点起点→途经点→终点，双击完成，生成流动水">＋流动水</button>
+          <button class="btn small primary" data-act="water-add-source"
+                  title="在地形上点选放置水源（可连续放置，Esc 结束）">＋水源</button>
+          <button class="btn small" data-act="water-clear-sources"
+                  title="删除全部水源（模拟会重新开始）">清空</button>
         </div>
         <div class="panel-body" id="water-list"></div>
       </div>
@@ -171,7 +180,7 @@ export class Ui {
 
     this.waterEditorPanelEl.innerHTML = `
       <div class="panel-head">
-        <span>水体编辑</span>
+        <span>水体模拟</span>
         <span class="count" id="water-sel-hint"></span>
       </div>
       <div class="panel-scroll"><div id="water-panel"></div></div>
@@ -202,8 +211,13 @@ export class Ui {
       btn.classList.toggle('active', btn.dataset.mode === this.mode);
     }
     this._closeMenus();
+    // 场景里的水源标记只在「水体编辑」模式下显示；离开时顺手结束放置
+    if (this.mode !== 'water') this.waterEditor?.cancel?.();
+    this.waterEditor?.setVisible?.(this.mode === 'water');
     if (this.mode === 'water') this.refreshWaterPanel();
     else this.renderAll();
+    // 提示文案跟着模式走（cancel() 里可能已经把提示重置成旧模式的了）
+    this.resetHint();
     this.onMode?.(this.mode);
   }
 
@@ -603,7 +617,7 @@ export class Ui {
     // 顶栏内的动作由 toolbar 自己的 handler 处理，这里跳过以免重复执行
     if (event.target.closest('#toolbar')) return;
     const target = event.target.closest(
-      '[data-act], .tree-node, .model-item[data-model-id], .model-item[data-water-id], .seg button',
+      '[data-act], .tree-node, .model-item[data-model-id], .model-item[data-source-id], .seg button',
     );
     if (!target) return;
 
@@ -613,9 +627,9 @@ export class Ui {
       return;
     }
 
-    // 水体列表行点击 → 选中并打开编辑面板
-    if (target.classList.contains('model-item') && target.dataset.waterId) {
-      this.waterSystem?.select({ kind: target.dataset.waterKind, id: target.dataset.waterId });
+    // 水源列表行点击 → 选中并打开编辑面板
+    if (target.classList.contains('model-item') && target.dataset.sourceId) {
+      this.water?.selectSource(target.dataset.sourceId);
       return;
     }
 
@@ -700,58 +714,44 @@ export class Ui {
       case 'delete-sel':
         this.editor.removeSelected();
         break;
-      case 'water-delete': {
-        const sel = this.waterSystem?.selected;
-        if (!sel) break;
-        if (sel.kind === 'area') this.waterSystem.removeArea(sel.id);
-        else this.waterSystem.removeFlow(sel.id);
+      case 'water-add-source': {
+        // 已在放置模式时再点一次 = 结束放置
+        if (this.waterEditor?.active) this.waterEditor.cancel();
+        else if (this.onWaterAddSource) this.onWaterAddSource();
+        else this.waterEditor?.startPlacement?.();
         break;
       }
-      case 'water-select': {
-        const kind = target.dataset.kind;
-        const id = target.dataset.id;
-        if (kind && id) this.waterSystem?.select({ kind, id });
+      case 'water-placement-end':
+        this.waterEditor?.cancel?.();
+        break;
+      case 'water-clear-sources': {
+        const count = this._waterSources().length;
+        if (!count) break;
+        if (!confirm(`清空全部 ${count} 个水源？（模拟水面会重新开始）`)) break;
+        this.water?.clearSources();
         break;
       }
-      case 'water-remove': {
-        const kind = target.dataset.kind;
-        const id = target.dataset.id;
-        if (!kind || !id) break;
-        if (kind === 'area') this.waterSystem.removeArea(id);
-        else this.waterSystem.removeFlow(id);
+      case 'water-source-remove': {
+        const id = target.dataset.source;
+        if (id) this.water?.removeSource(id);
         break;
       }
-      case 'water-undo-point':
-        this.onWaterUndoPoint?.();
+      case 'water-source-toggle': {
+        const id = target.dataset.source;
+        const source = this._waterSources().find((s) => s.id === id);
+        if (source) this.water?.updateSource(id, { enabled: !source.enabled });
         break;
-      case 'water-finish':
-        this.onWaterFinish?.();
+      }
+      case 'water-pause-toggle':
+        this.water?.setPaused(!this._waterSim().paused);
         break;
-      case 'water-cancel':
-        this.onWaterCancel?.();
-        break;
-      case 'water-undo':
-        this.onWaterUndo?.();
-        break;
-      case 'water-redraw':
-        this.onWaterRedraw?.();
+      case 'water-reset':
+        if (this.onWaterReset) this.onWaterReset();
+        else this.water?.reset();
         break;
       case 'water-save':
         this.onWaterSave?.();
         break;
-      case 'water-label-add': {
-        const sel = this.waterSystem?.selected;
-        if (!sel) break;
-        const input = this.inspectorBody.querySelector('[data-role="water-label-name"]');
-        this.waterSystem.addWaterLabel(sel.kind, sel.id, input?.value ?? '');
-        if (input) input.value = '';
-        break;
-      }
-      case 'water-label-remove': {
-        const sel = this.waterSystem?.selected;
-        if (sel) this.waterSystem.removeWaterLabel(sel.kind, sel.id, target.dataset.label);
-        break;
-      }
       case 'add-label': {
         if (!model) break;
         const input = this.inspectorBody.querySelector('[data-role="new-label-name"]');
@@ -768,12 +768,10 @@ export class Ui {
         this.editor.removeLabel(target.dataset.label);
         break;
 
-      // 面板里的按钮（水体添加、导入、开关等）与顶栏共用同一套动作
+      // 面板里的按钮（导入、开关等）与顶栏共用同一套动作
       case 'import':
       case 'export':
       case 'import-project':
-      case 'draw-area':
-      case 'draw-flow':
       case 'toggle-tags':
       case 'toggle-textures':
       case 'toggle-collision':
@@ -795,22 +793,32 @@ export class Ui {
     const act = el.dataset?.act;
     const model = this.editor.selected;
 
+    // ── 水体模拟：select / checkbox / 数字输入（滑杆走 _onInput）────────────────
+    if (act === 'water-resolution') {
+      this._waterApply(() => this.water?.setResolution(Number(el.value)));
+      return;
+    }
+    if (act === 'water-source-enabled') {
+      const id = this._selectedWaterSource()?.id;
+      if (id) this._waterApply(() => this.water?.updateSource(id, { enabled: el.checked }));
+      return;
+    }
+    if (act === 'water-source-target') {
+      const id = this._selectedWaterSource()?.id;
+      if (id) this._waterApply(() => this.water?.updateSource(id, { targetLevel: parseTargetLevel(el.value) }));
+      // 失焦后按归一化结果重绘（0 / 留空 → 不限制）
+      this.refreshWaterPanel();
+      return;
+    }
+    if (act === 'water-source-name') {
+      // 名称在 input 事件里已经写入，失焦时刷新列表文案
+      this.refreshWaterPanel();
+      return;
+    }
+
     if (act === 'rename' && model) {
       // 名称随当前选择：整体改模型名，部件改节点名；空值回退
       if (!this.editor.renameCurrent(el.value)) el.value = this.editor.currentName();
-      return;
-    }
-    if (act === 'water-rename') {
-      this._updateWater({ name: el.value });
-      return;
-    }
-    if (act === 'flow-point-width' || act === 'flow-point-dir') {
-      this._setFlowPoint(
-        Number(el.dataset.index),
-        act === 'flow-point-width'
-          ? { width: Math.max(0.5, Number(el.value) || 0.5) }
-          : { dir: Number(el.value) || 0 },
-      );
       return;
     }
     if (el.dataset?.field && el.dataset?.role === 'tv') this._commitTransformInput(el);
@@ -819,22 +827,51 @@ export class Ui {
   _onInput(event) {
     const el = event.target;
     const act = el.dataset?.act;
+    const water = this.water;
+
+    // ── 水体模拟：拖动滑杆实时生效；只调 water，不让面板整块重建（避免丢焦点）──
+    if (water && act === 'water-sim-speed') {
+      this._waterApply(() => water.setSimSpeed(Number(el.value)));
+      this._setRangeValue(el, `${Number(el.value).toFixed(1)}×`);
+      return;
+    }
+    if (water && act === 'water-amount') {
+      this._waterApply(() => water.setWaterAmount(Number(el.value)));
+      this._setRangeValue(el, `${Number(el.value).toFixed(0)} 米`);
+      return;
+    }
+    if (water && act === 'water-shimmer') {
+      this._waterApply(() => water.setVisual({ shimmer: Number(el.value) }));
+      this._setRangeValue(el, Number(el.value).toFixed(2));
+      return;
+    }
+    if (water && act === 'water-ripple') {
+      this._waterApply(() => water.setVisual({ ripple: Number(el.value) }));
+      this._setRangeValue(el, Number(el.value).toFixed(2));
+      return;
+    }
+    if (water && act === 'water-clarity') {
+      this._waterApply(() => water.setVisual({ clarity: Number(el.value) }));
+      this._setRangeValue(el, Number(el.value).toFixed(2));
+      return;
+    }
+    if (water && act === 'water-source-radius') {
+      const id = this._selectedWaterSource()?.id;
+      if (id) {
+        this._waterApply(() => water.updateSource(id, { radius: Number(el.value) }));
+        this._setRangeValue(el, `${Number(el.value).toFixed(0)} 米`);
+      }
+      return;
+    }
+    if (water && act === 'water-source-name') {
+      const id = this._selectedWaterSource()?.id;
+      if (id) this._waterApply(() => water.updateSource(id, { name: el.value }));
+      return;
+    }
+
     // 标签只有名称可编辑（类型是按钮选择）
     if (act === 'label-title') this.editor.updateLabel(el.dataset.label, { title: el.value });
-    else if (act === 'water-level') this._updateWaterSilently({ level: Number(el.value) });
-    else if (act === 'water-speed') this._updateWaterSilently({ speed: Number(el.value) });
-    else if (act === 'water-width') this._updateWaterSilently({ width: Number(el.value) });
-    else if (act === 'water-label-title') {
-      const sel = this.waterSystem?.selected;
-      if (sel) {
-        this._suppressWaterRender = true;
-        try {
-          this.waterSystem.updateWaterLabel(sel.kind, sel.id, el.dataset.label, { title: el.value });
-        } finally {
-          this._suppressWaterRender = false;
-        }
-      }
-    } else if (el.dataset?.role === 'tv') this._commitTransformInput(el);
+    else if (el.dataset?.role === 'tv') this._commitTransformInput(el);
   }
 
   /** 数值输入 → 模型或部件变换 */
@@ -867,6 +904,8 @@ export class Ui {
   setFps(fps) {
     this.stats.fps = fps;
     this.renderStats();
+    // 水体模式右下角的模拟步数 / 状态每 0.25s 跟着刷新
+    if (this.mode === 'water') this.renderWaterStats();
   }
 
   /** 更新工具栏「贴图」开关的文案/高亮（地形无瓦片时在提示里说明） */
@@ -892,21 +931,70 @@ export class Ui {
       : '相机碰撞关闭：可以钻到地形以下、飞出边界（自由穿行）';
   }
 
-  /** 水面总开关的按钮状态 */
+  /** 水面总开关的按钮状态（水体模拟的总开关，main 负责 setEnabled） */
   setWaterState(enabled) {
     const btn = this.toolbar.querySelector('[data-act="toggle-water"]');
     if (!btn) return;
     btn.textContent = enabled ? '水面：开' : '水面：关';
     btn.classList.toggle('on', enabled);
-    btn.title = enabled ? '水面总开关：正在显示所有水面区域与流动水' : '水面总开关：已隐藏所有水面区域与流动水';
+    btn.title = enabled ? '水体模拟总开关：正在显示模拟水面' : '水体模拟总开关：已隐藏模拟水面';
   }
 
-  /** 水面数据/选中变化后刷新：列表 + 编辑面板 */
+  // ── 水体模拟面板 ──────────────────────────────────────────────────────────
+  _waterSources() {
+    return this.water?.state?.sources ?? [];
+  }
+
+  _waterSim() {
+    return this.water?.state?.sim ?? WATER_SIM_FALLBACK;
+  }
+
+  _waterVisual() {
+    return this.water?.state?.visual ?? WATER_VISUAL_FALLBACK;
+  }
+
+  _selectedWaterSource() {
+    const id = this.water?.selectedId;
+    if (!id) return null;
+    return this._waterSources().find((source) => source.id === id) ?? null;
+  }
+
+  /** 包住一次 water 调用：期间 water.onChange 触发的面板刷新直接跳过（滑杆不丢焦点） */
+  _waterApply(fn) {
+    this._suppressWaterRender = true;
+    try {
+      fn();
+    } finally {
+      this._suppressWaterRender = false;
+    }
+  }
+
+  /** 滑杆旁边的数值显示（拖动时只改这一个 <b>，不重建面板） */
+  _setRangeValue(input, text) {
+    const out = input.closest('.field')?.querySelector('span b');
+    if (out) out.textContent = text;
+  }
+
+  /** 水体数据/选中变化后刷新：列表 + 编辑面板 + 场景水源标记 */
   refreshWaterPanel() {
     if (this._suppressWaterRender) return;
     this.renderWaterList();
     this.renderWaterInspector();
-    this.waterEditor?.syncNodes(); // 选中变化时同步场景里的可拖动节点
+    this.renderWaterStats();
+    this.waterEditor?.syncNodes?.(); // 场景标记跟着数据 / 选中变化
+  }
+
+  /** 底部状态文字：模拟步数 / 水源数（每 0.25s 由 setFps 顺带刷新） */
+  renderWaterStats() {
+    const host = this.waterBody?.querySelector?.('[data-role="water-stats"]');
+    if (!host) return;
+    const stats = this.water?.stats ?? {};
+    const steps = Number.isFinite(stats.steps) ? stats.steps : 0;
+    const sourceCount = Number.isFinite(stats.sourceCount) ? stats.sourceCount : this._waterSources().length;
+    const paused = stats.paused ?? this._waterSim().paused;
+    const wet = Number.isFinite(stats.wetCells) ? ` · ${stats.wetCells} 个湿格` : '';
+    const depth = Number.isFinite(stats.maxDepthMeters) ? ` · 最深 ${stats.maxDepthMeters.toFixed(2)} m` : '';
+    host.textContent = `步数 ${steps} · 水源 ${sourceCount}${wet}${depth}${paused ? ' · 已暂停' : ''}`;
   }
 
   /** 菜单/开关按钮的文案与高亮 */
@@ -942,236 +1030,183 @@ export class Ui {
     } else if (act === 'toggle-textures') this.onToggleTextures?.();
     else if (act === 'toggle-collision') this.onToggleCollision?.();
     else if (act === 'toggle-water') this.onToggleWater?.();
-    else if (act === 'draw-area') this.onDrawArea?.();
-    else if (act === 'draw-flow') this.onDrawFlow?.();
-    else if (act === 'tour') this.onToggleTour?.();    else if (act === 'reset') {
+    else if (act === 'tour') this.onToggleTour?.();
+    else if (act === 'reset') {
       if (confirm('清空所有场景模型与本地工程？（资源文件夹里的 glb 不会被删除）')) this.onReset?.();
     }
   }
 
-  /** 水体列表：水面区域 + 流动水，点击选中后打开编辑面板 */
+  /** 水源列表：名称 / 地面高程 / 半径 / 启用状态 / 删除，点击选中 */
   renderWaterList() {
-    const ws = this.waterSystem;
-    if (!this.waterList || !ws) return;
+    if (!this.waterList) return;
+    const sources = this._waterSources();
+    const selectedId = this.water?.selectedId ?? null;
     this.waterList.innerHTML = '';
-    const items = [
-      ...ws.state.areas.map((item) => ({ kind: 'area', item })),
-      ...ws.state.flows.map((item) => ({ kind: 'flow', item })),
-    ];
-    this.waterCount.textContent = `${items.length} 个`;
+    if (this.waterCount) this.waterCount.textContent = `${sources.length} 个水源`;
 
-    if (!items.length) {
+    if (!sources.length) {
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.innerHTML = '还没有水体对象。<br />点上方「＋水面区域」或「＋流动水」开始绘制。';
+      empty.innerHTML = '还没有水源。<br />点上方「＋水源」，在地形上点选放置。';
       this.waterList.append(empty);
       return;
     }
 
-    for (const { kind, item } of items) {
-      const active = ws.selected?.kind === kind && ws.selected?.id === item.id;
+    for (const source of sources) {
+      const active = source.id === selectedId;
+      const ground = this.water?.groundMetersAt?.(source.x, source.z);
+      const groundText = Number.isFinite(ground) ? `${ground.toFixed(1)} m` : '--';
+      const radiusText = Number.isFinite(source.radius) ? `${Math.round(source.radius)} m` : '--';
       const row = document.createElement('div');
       row.className = `model-item${active ? ' active' : ''}`;
-      row.dataset.waterKind = kind;
-      row.dataset.waterId = item.id;
+      row.dataset.sourceId = source.id;
+      row.title = `x ${Number(source.x).toFixed(1)} · z ${Number(source.z).toFixed(1)}`;
       row.innerHTML = `
-        <span class="dot" style="background:${kind === 'area' ? 'var(--accent)' : 'var(--accent-2)'}"></span>
-        <span class="name" title="${esc(item.name)}">${esc(item.name)}</span>
-        <span class="meta">${kind === 'area' ? `水面 ${item.points.length} 点` : `流动 ${item.points.length} 点`}</span>
-        <button class="icon-btn danger" data-act="water-remove" data-kind="${kind}" data-id="${item.id}" title="删除">✕</button>
+        <span class="dot" style="background:${source.enabled ? 'var(--accent-2)' : 'rgba(140,175,205,0.35)'}"></span>
+        <span class="name" title="${esc(source.name)}">${esc(source.name)}</span>
+        <span class="meta">地面 ${groundText} · R ${radiusText}</span>
+        <button class="icon-btn ${source.enabled ? 'on' : ''}" data-act="water-source-toggle" data-source="${source.id}"
+                title="${source.enabled ? '停用这个水源' : '启用这个水源'}">${source.enabled ? '◉' : '◌'}</button>
+        <button class="icon-btn danger" data-act="water-source-remove" data-source="${source.id}" title="删除水源">✕</button>
       `;
       this.waterList.append(row);
     }
   }
 
-  /** 改流动水某个关键点的宽度 / 横向朝向，并重建水带 */
-  _setFlowPoint(index, patch) {
-    const ws = this.waterSystem;
-    if (!ws || ws.selected?.kind !== 'flow' || !Number.isInteger(index)) return;
-    const flow = ws.selectedItem;
-    if (!flow || !flow.points[index]) return;
-    const points = flow.points.map((p, i) => (i === index ? { ...p, ...patch } : p));
-    this._suppressWaterRender = true;
-    try {
-      ws.updateFlow(flow.id, { points });
-    } finally {
-      this._suppressWaterRender = false;
-    }
-    this.refreshWaterPanel();
-  }
-
-  _updateWater(patch) {
-    const ws = this.waterSystem;
-    const sel = ws?.selected;
-    if (!sel) return;
-    if (sel.kind === 'area') {
-      const allowed = {};
-      if (patch.name != null) allowed.name = patch.name;
-      if (patch.level != null && Number.isFinite(patch.level)) allowed.level = patch.level;
-      ws.updateArea(sel.id, allowed);
-    } else {
-      const allowed = {};
-      if (patch.name != null) allowed.name = patch.name;
-      if (patch.speed != null && Number.isFinite(patch.speed)) allowed.speed = Math.max(0.05, patch.speed);
-      if (patch.width != null && Number.isFinite(patch.width)) allowed.width = Math.max(1, patch.width);
-      ws.updateFlow(sel.id, allowed);
-    }
-  }
-
-  _updateWaterSilently(patch) {
-    this._suppressWaterRender = true;
-    try {
-      this._updateWater(patch);
-    } finally {
-      this._suppressWaterRender = false;
-    }
-  }
-
-  /** 水体检查器：名称 / 高度（区域）或流速宽度（流动水）/ 撤回·编辑·保存 / 水体标签 / 删除 */
+  /** 右面板：放置提示 / 模拟参数 / 选中水源 / 外观 / 保存 + 状态 */
   renderWaterInspector() {
     if (!this.waterBody) return;
-
-    // 绘制中（从第一个点开始）就显示草稿面板
-    if (this.waterEditor?.active) {
-      this.renderWaterDraft();
-      return;
-    }
-
-    const ws = this.waterSystem;
-    const sel = ws?.selected;
-    const item = ws?.selectedItem;
     this.waterBody.innerHTML = '';
-    if (this.waterSelHint) this.waterSelHint.textContent = '';
-    if (!sel || !item) {
-      const hint = document.createElement('div');
-      hint.className = 'empty';
-      hint.style.padding = '14px 12px';
-      hint.innerHTML = '从左侧列表选择水面区域或流动水<br />选中后可改名称 / 高度 / 流速。';
-      this.waterBody.append(hint);
+
+    // 放置模式：只显示放置提示 + 结束按钮
+    if (this.waterEditor?.active) {
+      if (this.waterSelHint) this.waterSelHint.textContent = '放置模式';
+      const box = document.createElement('div');
+      box.className = 'section';
+      box.innerHTML = `
+        <div class="section-title">
+          <span>放置水源</span>
+          <span style="font-weight:400;color:var(--dim)">可连续放置</span>
+        </div>
+        <div class="hint-line">
+          在地形上点击放置水源（左键拖动仍然是转视角，不会误放点）。Esc 或下方按钮结束放置。
+        </div>
+        <button class="btn small primary" data-act="water-placement-end">结束放置</button>
+      `;
+      this.waterBody.append(box);
       return;
     }
-    const isArea = sel.kind === 'area';
-    if (this.waterSelHint) this.waterSelHint.textContent = isArea ? '水面区域' : '流动水';
 
-    // 重新编辑 / 保存（「撤回」只用于绘制中的撤点，见草稿面板）
-    const actions = document.createElement('div');
-    actions.className = 'section';
-    actions.innerHTML = `
+    const source = this._selectedWaterSource();
+    if (this.waterSelHint) this.waterSelHint.textContent = source ? source.name : '未选择水源';
+
+    // ① 模拟参数
+    const sim = this._waterSim();
+    const simSection = document.createElement('div');
+    simSection.className = 'section';
+    const resolutionOptions = WATER_RESOLUTIONS.map(
+      (value) => `<option value="${value}" ${value === sim.resolution ? 'selected' : ''}>${value}</option>`,
+    ).join('');
+    simSection.innerHTML = `
+      <div class="section-title">
+        <span>模拟参数</span>
+        <span style="font-weight:400;color:var(--dim)">${this._waterSources().length} 个水源</span>
+      </div>
+      <label class="field"><span>模拟速度 <b>${Number(sim.speed).toFixed(1)}×</b></span>
+        <input type="range" data-act="water-sim-speed" min="0.1" max="4" step="0.1" value="${sim.speed}" />
+      </label>
+      <label class="field"><span>每次注水量 <b>${Math.round(sim.waterAmount)} 米</b></span>
+        <input type="range" data-act="water-amount" min="1" max="300" step="1" value="${Math.round(sim.waterAmount)}" />
+      </label>
       <div class="row">
-        <button class="btn small" data-act="water-redraw" title="重新点选边界 / 路径，替换当前对象">重新编辑</button>
+        <label class="field grow"><span>模拟精度</span>
+          <select data-act="water-resolution">${resolutionOptions}</select>
+        </label>
+        <div class="field grow"><span>模拟</span>
+          <button class="btn small ${sim.paused ? 'primary' : ''}" data-act="water-pause-toggle">
+            ${sim.paused ? '继续' : '暂停'}
+          </button>
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn small" data-act="water-reset" title="把水位与流量清零，重新开始模拟">重置模拟</button>
+      </div>
+      <div class="hint-line">
+        模拟域自动覆盖整个 8 km 地形；精度越高越细腻，但 GPU 开销也越大。
+      </div>
+    `;
+    this.waterBody.append(simSection);
+
+    // ② 选中水源
+    if (source) {
+      const ground = this.water?.groundMetersAt?.(source.x, source.z);
+      const groundText = Number.isFinite(ground) ? `${ground.toFixed(1)} m` : '--';
+      const targetValue = source.targetLevel == null ? '' : Number(source.targetLevel.toFixed(1));
+      const editSection = document.createElement('div');
+      editSection.className = 'section';
+      editSection.innerHTML = `
+        <div class="section-title">
+          <span>选中水源</span>
+          <span style="font-weight:400;color:var(--dim)">x ${Number(source.x).toFixed(1)} · z ${Number(source.z).toFixed(1)}</span>
+        </div>
+        <label class="field"><span>名称</span>
+          <input type="text" data-act="water-source-name" value="${esc(source.name)}" />
+        </label>
+        <div class="field"><span>地面高程 <b>${groundText}</b></span>
+          <div class="readout">随水源位置自动更新（只读）</div>
+        </div>
+        <label class="field"><span>水源半径 <b>${Math.round(source.radius)} 米</b></span>
+          <input type="range" data-act="water-source-radius" min="20" max="2000" step="10" value="${Math.round(source.radius)}" />
+        </label>
+        <label class="field"><span>目标水面高程（米，0 = 不限制）</span>
+          <input type="number" step="1" data-act="water-source-target" value="${targetValue}"
+                 placeholder="0 / 留空 = 不限制" />
+        </label>
+        <label class="field inline">
+          <input type="checkbox" data-act="water-source-enabled" ${source.enabled ? 'checked' : ''} />
+          <span>启用这个水源</span>
+        </label>
+        <button class="btn small danger" data-act="water-source-remove" data-source="${source.id}">删除这个水源</button>
+      `;
+      this.waterBody.append(editSection);
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.style.padding = '14px 12px';
+      empty.innerHTML = '从左侧列表或场景里的标记选择一个水源<br />可改名称 / 半径 / 目标水面高程。';
+      this.waterBody.append(empty);
+    }
+
+    // ③ 外观
+    const visual = this._waterVisual();
+    const visualSection = document.createElement('div');
+    visualSection.className = 'section';
+    visualSection.innerHTML = `
+      <div class="section-title"><span>外观</span></div>
+      <label class="field"><span>太阳高光 <b>${Number(visual.shimmer).toFixed(2)}</b></span>
+        <input type="range" data-act="water-shimmer" min="0" max="3" step="0.05" value="${visual.shimmer}" />
+      </label>
+      <label class="field"><span>波纹强度 <b>${Number(visual.ripple).toFixed(2)}</b></span>
+        <input type="range" data-act="water-ripple" min="0" max="2" step="0.05" value="${visual.ripple}" />
+      </label>
+      <label class="field"><span>水体清澈度 <b>${Number(visual.clarity).toFixed(2)}</b></span>
+        <input type="range" data-act="water-clarity" min="0" max="1" step="0.01" value="${visual.clarity}" />
+      </label>
+      <div class="hint-line">清澈度 0 = 浑浊、1 = 通透；太阳高光与波纹强度控制水面质感。</div>
+    `;
+    this.waterBody.append(visualSection);
+
+    // ④ 保存 + 状态
+    const saveSection = document.createElement('div');
+    saveSection.className = 'section';
+    saveSection.innerHTML = `
+      <div class="row">
         <button class="btn small primary" data-act="water-save" title="立即保存到本地工程">保存</button>
       </div>
+      <div class="water-stats" data-role="water-stats"></div>
     `;
-    this.waterBody.append(actions);
-
-    const base = document.createElement('div');
-    base.className = 'section';
-    base.innerHTML = `
-      <div class="section-title">
-        <span>${isArea ? '水面区域' : '流动水'}</span>
-        <span style="font-weight:400;color:var(--dim)">${item.points.length} 个选点</span>
-      </div>
-      <label class="field"><span>名称 / 标签</span>
-        <input type="text" data-act="water-rename" value="${esc(item.name)}" />
-      </label>
-      ${
-        isArea
-          ? `<div class="field"><span>水面高度（米）</span>
-               <input type="number" step="0.5" data-act="water-level" value="${item.level.toFixed(2)}" />
-             </div>
-             <div style="font-size:10.5px;color:var(--dim);line-height:1.5">
-               高度取自选点地表高程的平均值，可在此微调；整块水面保持水平。
-             </div>`
-          : `<div class="row">
-               <label class="field grow"><span>流速（倍率）</span>
-                 <input type="number" step="0.1" min="0.05" data-act="water-speed" value="${item.speed}" />
-               </label>
-               <label class="field grow"><span>宽度（米）</span>
-                 <input type="number" step="1" min="1" data-act="water-width" value="${item.width}" />
-               </label>
-             </div>
-             <div style="font-size:10.5px;color:var(--dim);line-height:1.5">
-               水贴图沿路径方向滚动，流速越大动画越快。
-             </div>`
-      }
-    `;
-    this.waterBody.append(base);
-
-    // 关键点：每个点可单独调宽度与横向朝向（水带贴模型表面时尤其有用）
-    if (!isArea) {
-      const keys = document.createElement('div');
-      keys.className = 'section';
-      keys.innerHTML = `
-        <div class="section-title">
-          <span>关键点</span>
-          <span style="font-weight:400;color:var(--dim)">每点独立宽度 / 方向</span>
-        </div>
-        ${item.points
-          .map(
-            (p, i) => `
-          <div class="row" style="align-items:center;gap:6px;margin-bottom:4px">
-            <span class="badge" style="flex:none">P${i + 1}</span>
-            <label class="field grow" style="margin:0"><span>宽 m</span>
-              <input type="number" step="1" min="0.5" data-act="flow-point-width" data-index="${i}"
-                     value="${(Number.isFinite(p.width) ? p.width : item.width).toFixed(1)}" />
-            </label>
-            <label class="field grow" style="margin:0"><span>方向 °</span>
-              <input type="number" step="5" data-act="flow-point-dir" data-index="${i}"
-                     value="${Number.isFinite(p.dir) ? p.dir : 0}" />
-            </label>
-          </div>`,
-          )
-          .join('')}
-        <div style="font-size:10.5px;color:var(--dim);line-height:1.5">
-          方向 = 该点的横向朝向（绕表面法线旋转，0° 自动）；水带贴到模型 / 地形表面。
-        </div>
-      `;
-      this.waterBody.append(keys);
-    }
-
-    const danger = document.createElement('div');
-    danger.className = 'section';
-    danger.innerHTML = `<button class="btn small danger" data-act="water-delete">删除${isArea ? '这个水面区域' : '这条流动水'}</button>`;
-    this.waterBody.append(danger);
-  }
-
-  /** 绘制中的草稿面板：点数 / 实时平均水面 / 撤回上一点 / 完成 / 取消 */
-  renderWaterDraft() {
-    const we = this.waterEditor;
-    const d = we?.drawing;
-    if (!d || !this.waterBody) return;
-    const isArea = d.type === 'area';
-    const minPoints = isArea ? 3 : 2;
-    const enough = d.points.length >= minPoints;
-
-    this.waterBody.innerHTML = '';
-    if (this.waterSelHint) this.waterSelHint.textContent = '草稿';
-
-    const box = document.createElement('div');
-    box.className = 'section';
-    box.innerHTML = `
-      <div class="section-title">
-        <span>正在绘制 · ${isArea ? '水面区域' : '流动水'}</span>
-        <span style="font-weight:400;color:var(--dim)">${d.points.length} 个选点</span>
-      </div>
-      ${
-        isArea
-          ? `<div class="field"><span>实时平均水面 <b>${we.averageMeters().toFixed(1)} m</b></span></div>`
-          : `<div class="field"><span>已选 ${d.points.length} 点（起点 → 途经点 → 终点）</span></div>`
-      }
-      <div class="row">
-        <button class="btn small" data-act="water-undo-point" ${d.points.length ? '' : 'disabled'}
-                title="撤掉刚刚选的那个点">撤回上一点</button>
-        <button class="btn small primary" data-act="water-finish" ${enough ? '' : 'disabled'}
-                title="${isArea ? '至少 3 点才能完成' : '至少 2 点才能完成'}">完成</button>
-        <button class="btn small" data-act="water-cancel">取消</button>
-      </div>
-      <div style="font-size:10.5px;color:var(--dim);line-height:1.5">
-        在地形上点击继续选点${isArea ? '（至少 3 点）' : '（起点 → 途经点 → 终点，至少 2 点）'}，
-        完成后点「完成」；Esc 也可取消。
-      </div>
-    `;
-    this.waterBody.append(box);
+    this.waterBody.append(saveSection);
+    this.renderWaterStats();
   }
 
   toast(message) {
@@ -1181,10 +1216,15 @@ export class Ui {
     this._hintTimer = setTimeout(() => this.resetHint(), 6000);
   }
 
-  /** 恢复默认提示（绘制结束/取消时用） */
+  /** 恢复默认提示（放置结束/取消、卡点提示过期时用） */
   resetHint() {
     clearTimeout(this._hintTimer);
     this.hint.style.color = '';
-    this.hint.textContent = DEFAULT_HINT;
+    this.hint.textContent = this._defaultHint();
+  }
+
+  /** 当前模式的默认提示文案 */
+  _defaultHint() {
+    return this.mode === 'water' ? WATER_HINT : DEFAULT_HINT;
   }
 }

@@ -1,23 +1,46 @@
 /**
- * 水面绘制/编辑交互。
+ * 水源选点放置 / 场景标记 / 拖动。
  *
- *   area：在地形上依次点选 → 实时取各点地表高程的**平均值**作为该区域水平面高度，
- *         预览里立刻出现真实水面材质（与最终水面同一 shader）；
- *   flow：依次点起点 → 若干途经点 → 终点，预览直接生成流动水带（同一套流动材质）。
+ * 与旧「画水面区域 + 流动水」不同，这里只做一件事：在地形上点选**水源**，
+ * 交给 FluidWater 后由 GPU 浅水模拟自己扩散成水面。交互约定：
  *
- * 关键点：
- *   - 选点用 cameraControls.pick()（射线步进 + CPU 高度采样）而不是 raycast 打网格 ——
- *     地形几何是平面（高度在 shader 里位移），打网格得到的点是错的
- *   - 每个选点都有编号标记，连线 + 实时水面，避免"选点不清楚"
- *   - 完成用面板上的「完成」按钮；Enter 是快捷方式，双击不再生效
+ *   - `startPlacement()`：进入放置模式（关闭模型拾取），在地形上连续点击即可连续放水源；
+ *     左键拖动（位移 > 6px）仍算转视角，不会误放点。`Esc` / `cancel()` 退出。
+ *   - 每个水源在场景里有一个青色小球（地面之上）+ 一个半径圆环（贴地）+ CSS2D 名称序号。
+ *     小球可以按住水平拖动，松开时 `water.updateSource(id, { x, z })` 提交
+ *     （地面高程由 FluidWater 按新位置自动跟随）。
+ *   - 点击小球选中（`water.selectSource(id)`），选中标记变白/黄。
+ *
+ * 坐标约定：外部一律用「米」/世界坐标；标记的 y 由 `water.groundMetersAt()` 换算出世界 y。
  */
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
-import { flowCurve, buildFlowGeometry } from './waterSystem.js';
+
+const SPHERE_RADIUS = 13; // 小球半径（世界单位）
+const SPHERE_LIFT = 26; // 小球离地高度（世界单位）
+const RING_LIFT = 2.0; // 圆环离地高度，避免与地形 z-fighting
+const LABEL_LIFT = 30; // CSS2D 名称在球心之上
+const CLICK_SLOP = 6; // 位移超过这个像素算拖拽视角，不算点击
+
+const COLOR_SOURCE = 0x7fe6d4; // 青色：普通水源
+const COLOR_SELECTED = 0xffd166; // 黄色：选中水源的地面圆环
+const COLOR_SELECTED_CORE = 0xf2fbff; // 白：选中水源的小球
 
 export class WaterEditor {
-  constructor({ system, editor, camera, domElement, scene, cameraControls, onStatus, onDraftChange }) {
-    this.system = system;
+  /**
+   * @param {{
+   *   water: import('../water/fluidWater.js').FluidWater,
+   *   editor: import('./editor.js').Editor,
+   *   camera: THREE.PerspectiveCamera,
+   *   domElement: HTMLElement,
+   *   scene: THREE.Scene,
+   *   cameraControls: import('../viewer/controls.js').TerrainControls,
+   *   onStatus?: (text: string | null) => void,
+   *   onDraftChange?: (editor: WaterEditor) => void,
+   * }} opts
+   */
+  constructor({ water, editor, camera, domElement, scene, cameraControls, onStatus, onDraftChange }) {
+    this.water = water;
     this.editor = editor;
     this.camera = camera;
     this.dom = domElement;
@@ -25,426 +48,348 @@ export class WaterEditor {
     this.onStatus = onStatus;
     this.onDraftChange = onDraftChange;
 
-    this.drawing = null; // { type: 'area'|'flow', points: [], target? }
-    this._down = null;
+    this.placement = false; // 放置模式
+    this.visible = false; // 只在「水体编辑」模式下显示标记
+    this.tourHidden = false; // 游览模式（无 UI）下临时隐藏标记，避免截图里出现小球/圆环
+    this._down = null; // 放置模式的按下点（区分点击 / 拖视角）
+    this._drag = null; // 拖动水源小球时的状态
+    this._hoverId = null;
 
-    this.preview = new THREE.Group();
-    this.preview.name = 'water-preview';
-    this.preview.renderOrder = 20;
-    scene.add(this.preview);
+    // 场景标记（与水面网格分开，由本类全权管理）
+    this.group = new THREE.Group();
+    this.group.name = 'water-source-markers';
+    this.group.visible = false;
+    scene?.add(this.group);
 
-    this.lineMaterial = new THREE.LineBasicMaterial({
-      color: 0xffd166,
+    // 共享几何 / 材质：小球与圆环都复用，只有圆环用 scale 表示半径
+    this.sphereGeometry = new THREE.SphereGeometry(SPHERE_RADIUS, 18, 12);
+    this.ringGeometry = new THREE.RingGeometry(0.994, 1, 96);
+    this.ringGeometry.rotateX(-Math.PI / 2);
+
+    this.sphereMaterial = new THREE.MeshBasicMaterial({
+      color: COLOR_SOURCE,
       transparent: true,
-      opacity: 0.95,
+      opacity: 0.92,
       depthTest: false,
+      depthWrite: false,
     });
-    this.markerGeometry = new THREE.SphereGeometry(10, 12, 8);
-    this.markerMaterial = new THREE.MeshBasicMaterial({ color: 0xffd166, depthTest: false });
-    this._previewMaterials = []; // 需要随预览一起释放的材质（流动水带）
+    this.sphereMaterialSelected = new THREE.MeshBasicMaterial({
+      color: COLOR_SELECTED_CORE,
+      transparent: true,
+      opacity: 1,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.ringMaterial = new THREE.MeshBasicMaterial({
+      color: COLOR_SOURCE,
+      transparent: true,
+      opacity: 0.4,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    this.ringMaterialSelected = new THREE.MeshBasicMaterial({
+      color: COLOR_SELECTED,
+      transparent: true,
+      opacity: 0.72,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
 
-    // 选中水体的可拖动节点（青色小球 + 序号）
-    this.nodes = new THREE.Group();
-    this.nodes.name = 'water-nodes';
-    scene.add(this.nodes);
-    this.nodeMeshes = [];
-    this.nodeMaterial = new THREE.MeshBasicMaterial({ color: 0x7fe6d4, depthTest: false });
-    this.nodeHoverMaterial = new THREE.MeshBasicMaterial({ color: 0xf2fbff, depthTest: false });
-    this.nodeRaycaster = new THREE.Raycaster();
-    this._drag = null; // { kind, id, index, plane }
-    this._plane = new THREE.Plane();
+    this.raycaster = new THREE.Raycaster();
+    /** @type {Map<string, { id: string, source: object, index: number, sphere: THREE.Mesh, ring: THREE.Mesh, label: CSS2DObject }>} */
+    this.nodes = new Map();
 
     this._bind();
   }
 
+  /** 是否处于放置模式（UI / main 用它切右面板与 Esc 行为） */
   get active() {
-    return Boolean(this.drawing);
+    return this.placement;
   }
 
-  start(type) {
-    this.cancel();
-    this.drawing = { type: type === 'flow' ? 'flow' : 'area', points: [] };
-    this.editor.setPickingEnabled(false); // 绘制时别去选模型
-    this.system.clearSelection();
-    this._draftChanged();
-    return this.drawing;
-  }
-
-  /**
-   * 重新编辑已有水体：重新点选边界/路径，完成后替换原对象
-   * （名称、流速/宽度都保留）
-   */
-  redraw(kind, id) {
-    const list = kind === 'area' ? this.system.state.areas : this.system.state.flows;
-    const item = list.find((x) => x.id === id);
-    if (!item) return false;
-    this.start(kind);
-    this.drawing.target = { kind, id };
-    this._draftChanged();
-    return true;
-  }
-
-  cancel() {
-    if (!this.drawing) return;
-    this.drawing = null;
-    this._clearPreview();
-    this.editor.setPickingEnabled(true);
-    this.onStatus?.(null);
-    this.onDraftChange?.();
-  }
-
-  finish() {
-    const d = this.drawing;
-    if (!d) return null;
-    const minPoints = d.type === 'area' ? 3 : 2;
-    if (d.points.length < minPoints) {
-      this.onStatus?.(
-        d.type === 'area' ? '水面区域至少需要 3 个点' : '流动水至少需要起点和终点',
-      );
-      return null;
+  /** 只在「水体编辑」模式下显示场景标记 */
+  setVisible(on) {
+    this.visible = Boolean(on);
+    if (!this.visible) {
+      this.dom.style.cursor = '';
+      if (this.placement) this.cancel();
     }
-
-    let created = null;
-    if (d.type === 'area') {
-      const level = this.averageMeters();
-      if (d.target) {
-        this.system.updateArea(d.target.id, { points: d.points, level });
-        created = { id: d.target.id };
-      } else {
-        created = this.system.addArea({ points: d.points, level });
-      }
-    } else if (d.target) {
-      this.system.updateFlow(d.target.id, { points: d.points });
-      created = { id: d.target.id };
-    } else {
-      created = this.system.addFlow({ points: d.points });
-    }
-
-    const kind = d.type;
-    this.drawing = null;
-    this._clearPreview();
-    this.editor.setPickingEnabled(true);
-    this.onStatus?.(null);
-    if (created) this.system.select({ kind, id: created.id });
-    this.onDraftChange?.();
-    return created;
+    this._applyVisibility();
   }
 
-  /** 撤回刚刚选完的那一个点 */
-  undoPoint() {
-    const d = this.drawing;
-    if (!d || !d.points.length) return false;
-    d.points.pop();
-    this._updatePreview();
-    this._draftChanged();
-    return true;
+  /** 游览模式（无 UI）下隐藏标记；退出游览后按模式恢复 */
+  setTourHidden(on) {
+    this.tourHidden = Boolean(on);
+    this._applyVisibility();
   }
 
-  /** 追加一个选点（鼠标选点与程序化调用共用） */
-  addPointAt(point) {
-    if (!this.drawing || !point) return;
-    if (this.drawing.type === 'area') {
-      this.drawing.points.push([point.x, point.z]);
-    } else {
-      // 流动水的关键点带自己的宽度 / 横向朝向（null = 跟随全局与自动方向）
-      this.drawing.points.push({ x: point.x, y: point.y + 0.6, z: point.z, width: null, dir: null });
-    }
-    this._updatePreview();
-    this._draftChanged();
+  _applyVisibility() {
+    this.group.visible = this.visible && !this.tourHidden;
+    if (!this.group.visible && this.dom) this.dom.style.cursor = '';
   }
 
-  /** 当前选点的平均地表高程（米） */
-  averageMeters() {
-    const pts = this.drawing?.points ?? [];
-    if (!pts.length) return this.system.state.level;
-    let sum = 0;
-    for (const p of pts) {
-      const x = Array.isArray(p) ? p[0] : p.x;
-      const z = Array.isArray(p) ? (p.length === 3 ? p[2] : p[1]) : p.z;
-      sum += this.system.groundMetersAt(x, z);
-    }
-    return sum / pts.length;
-  }
-
-  _status() {
-    const d = this.drawing;
-    if (!d) {
-      this.onStatus?.(null);
-      return;
-    }
-    if (d.type === 'area') {
-      this.onStatus?.(
-        `水面区域：已选 ${d.points.length} 点 · 实时平均水面 ${this.averageMeters().toFixed(1)} m · 右侧点「完成」结束`,
-      );
-    } else {
-      this.onStatus?.(
-        `流动水：已选 ${d.points.length} 点（起点 → 途经点 → 终点）· 右侧点「完成」结束`,
-      );
-    }
-  }
-
-  _draftChanged() {
-    this._status();
+  // ── 放置模式 ──────────────────────────────────────────────────────────────
+  startPlacement() {
+    if (this.placement) return;
+    this.placement = true;
+    this._down = null;
+    this._drag = null;
+    this.editor?.setPickingEnabled?.(false); // 放置时点击不再选模型
+    document.body?.classList.add('water-placing');
+    this.onStatus?.('在地形上点选放置水源（可连续放置）· Esc 结束');
     this.onDraftChange?.(this);
   }
 
-  _bind() {
-    // 非绘制状态下：点住选中水体的节点即可拖动
-    this.dom.addEventListener('pointerdown', (event) => {
-      if (event.button !== 0) return;
-      if (!this.drawing) {
-        const hit = this._pickNode(event.clientX, event.clientY);
-        if (hit) {
-          this._startNodeDrag(hit);
-          return;
-        }
-      }
-      if (!this.drawing) return;
-      this._down = { x: event.clientX, y: event.clientY };
-    });
-
-    this.dom.addEventListener('pointermove', (event) => {
-      if (this._drag) this._dragMove(event);
-    });
-
-    this.dom.addEventListener('pointerup', (event) => {
-      if (this._drag) {
-        this._endNodeDrag();
-        return;
-      }
-      if (!this.drawing || event.button !== 0 || !this._down) return;
-      const dx = event.clientX - this._down.x;
-      const dy = event.clientY - this._down.y;
-      this._down = null;
-      if (Math.hypot(dx, dy) > 6) return; // 拖拽视角，不算选点
-      const hit = this._groundHit(event.clientX, event.clientY);
-      if (!hit) return;
-      this.addPointAt(hit);
-    });
-
-    window.addEventListener('keydown', (event) => {
-      if (!this.drawing) return;
-      const typing =
-        event.target instanceof HTMLInputElement ||
-        event.target instanceof HTMLTextAreaElement ||
-        event.target instanceof HTMLSelectElement;
-      if (typing) return;
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        this.finish();
-      } else if (event.key === 'Escape') {
-        event.preventDefault();
-        this.cancel();
-      }
-    });
+  cancel() {
+    if (!this.placement) return;
+    this.placement = false;
+    this._down = null;
+    this.editor?.setPickingEnabled?.(true);
+    document.body?.classList.remove('water-placing');
+    this.dom.style.cursor = '';
+    this.onStatus?.(null);
+    this.onDraftChange?.(this);
   }
 
-  /** 精确取地表交点：射线步进 + CPU 高度采样（cameraControls.pick） */
-  _groundHit(clientX, clientY) {
-    const hit = this.cameraControls?.pick?.(clientX, clientY);
-    if (!hit) return null;
-    return new THREE.Vector3(hit.x, hit.y, hit.z);
-  }
-
-  // ── 选中水体的节点：显示 + 拖动 ───────────────────────────────────────────
-  /** 节点世界坐标：静止水面画在水平面上，流动水画在点自己的空间位置上 */
-  _nodeWorldPosition(kind, id, index) {
-    if (kind === 'area') {
-      const area = this.system.state.areas.find((a) => a.id === id);
-      const p = area?.points[index];
-      if (!p) return null;
-      return new THREE.Vector3(p[0], this.system.metersToWorldY(area.level) + 4, p[1]);
-    }
-    const flow = this.system.state.flows.find((f) => f.id === id);
-    const p = flow?.points[index];
-    if (!p) return null;
-    return new THREE.Vector3(p.x, p.y + 4, p.z);
-  }
-
-  /** 与当前选中同步：给选中的水体画一排可拖动节点 */
+  // ── 场景标记 ──────────────────────────────────────────────────────────────
+  /** 按 `water.state.sources` 重建/同步标记；选中高亮跟着 `water.selectedId` */
   syncNodes() {
-    this._clearNodes();
-    const sel = this.system.selected;
-    const item = this.system.selectedItem;
-    if (!sel || !item) return;
-    item.points.forEach((_, index) => {
-      const position = this._nodeWorldPosition(sel.kind, sel.id, index);
-      if (!position) return;
-      const marker = new THREE.Mesh(this.markerGeometry, this.nodeMaterial);
-      marker.position.copy(position);
-      marker.renderOrder = 30;
-      marker.userData = { nodeKind: sel.kind, nodeId: sel.id, nodeIndex: index };
-      // 序号挂成子对象，节点移动时自动跟随
-      const el = document.createElement('div');
-      el.className = 'pick-index';
-      el.textContent = String(index + 1);
-      const label = new CSS2DObject(el);
-      label.position.set(0, 20, 0);
-      marker.add(label);
-      this.nodes.add(marker);
-      this.nodeMeshes.push(marker);
-    });
-  }
+    const sources = this.water?.state?.sources ?? [];
+    const selectedId = this.water?.selectedId ?? null;
 
-  _clearNodes() {
-    for (const marker of [...this.nodes.children]) {
-      this.nodes.remove(marker);
-      for (const child of marker.children) child.element?.remove?.();
+    const alive = new Set(sources.map((source) => source.id));
+    for (const node of [...this.nodes.values()]) {
+      if (!alive.has(node.id)) this._disposeNode(node);
     }
-    this.nodeMeshes.length = 0;
+
+    sources.forEach((source, index) => {
+      let node = this.nodes.get(source.id);
+      if (!node) {
+        node = this._createNode(source);
+        this.nodes.set(source.id, node);
+      }
+      node.source = source;
+      node.index = index;
+      this._positionNode(node);
+      this._styleNode(node, source.id === selectedId);
+    });
+
+    this._applyVisibility();
   }
 
-  _pickNode(clientX, clientY) {
-    if (!this.nodeMeshes.length) return null;
+  _createNode(source) {
+    const sphere = new THREE.Mesh(this.sphereGeometry, this.sphereMaterial);
+    sphere.renderOrder = 40;
+    sphere.userData = { sourceId: source.id };
+
+    const ring = new THREE.Mesh(this.ringGeometry, this.ringMaterial);
+    ring.renderOrder = 30;
+
+    const element = document.createElement('div');
+    element.className = 'water-source-label';
+    const label = new CSS2DObject(element);
+    label.position.set(0, LABEL_LIFT, 0);
+    sphere.add(label);
+
+    this.group.add(sphere);
+    this.group.add(ring);
+    return { id: source.id, source, index: 0, sphere, ring, label, element };
+  }
+
+  _disposeNode(node) {
+    this.group.remove(node.sphere);
+    this.group.remove(node.ring);
+    node.element?.remove?.();
+    this.nodes.delete(node.id);
+  }
+
+  _styleNode(node, selected) {
+    node.sphere.material = selected ? this.sphereMaterialSelected : this.sphereMaterial;
+    node.ring.material = selected ? this.ringMaterialSelected : this.ringMaterial;
+    node.element?.classList.toggle('active', Boolean(selected));
+  }
+
+  /** 世界坐标换算：地表绝对高程（米）→ 世界 y，再加标记高度偏移 */
+  _groundWorldY(x, z, lift = 0) {
+    const meters = this.water?.groundMetersAt?.(x, z);
+    if (!Number.isFinite(meters)) {
+      const fallback = this.editor?.groundY?.(x, z);
+      return Number.isFinite(fallback) ? fallback + lift : lift;
+    }
+    const heightField = this.editor?.heightField;
+    const minMeters = heightField?.elevation?.minMeters ?? 0;
+    const exaggeration = this.editor?.env?.uExaggeration?.value ?? 1;
+    return (meters - minMeters) * exaggeration + lift;
+  }
+
+  _positionNode(node) {
+    const source = node.source;
+    const groundY = this._groundWorldY(source.x, source.z);
+    const radius = Math.max(1, Number(source.radius) || 250);
+    node.sphere.position.set(source.x, groundY + SPHERE_LIFT, source.z);
+    node.ring.position.set(source.x, groundY + RING_LIFT, source.z);
+    node.ring.scale.set(radius, 1, radius);
+    if (node.element) {
+      node.element.textContent = `${node.index + 1} · ${source.name || '水源'}`;
+    }
+  }
+
+  // ── 交互 ──────────────────────────────────────────────────────────────────
+  _bind() {
+    this._handlePointerDown = this._handlePointerDown.bind(this);
+    this._handlePointerMove = this._handlePointerMove.bind(this);
+    this._handlePointerUp = this._handlePointerUp.bind(this);
+    this._handleKeyDown = this._handleKeyDown.bind(this);
+
+    this.dom.addEventListener('pointerdown', this._handlePointerDown);
+    this.dom.addEventListener('pointermove', this._handlePointerMove);
+    this.dom.addEventListener('pointerup', this._handlePointerUp);
+    window.addEventListener('keydown', this._handleKeyDown);
+  }
+
+  _handlePointerDown(event) {
+    if (event.button !== 0) return;
+
+    // 放置模式：只记录按下点，松手时若没怎么拖动才落点
+    if (this.placement) {
+      this._down = { x: event.clientX, y: event.clientY };
+      return;
+    }
+
+    if (!this.visible || this.tourHidden) return;
+    const hit = this._pickSource(event.clientX, event.clientY);
+    // 小球上的 userData 只有 sourceId（水源对象每次 sync 会换新引用），这里按 id 查当前水源
+    const sourceId = hit?.object?.userData?.sourceId ?? null;
+    const source = sourceId ? this.nodes.get(sourceId)?.source : null;
+    if (!source) return;
+
+    // 开始拖动某个水源：选中它、关掉相机、记下起点
+    this.water?.selectSource?.(source.id);
+    this._drag = {
+      id: source.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      nextX: null,
+      nextZ: null,
+    };
+    this.cameraControls?.setEnabled?.(false);
+    this.editor?.setPickingEnabled?.(false);
+    try {
+      this.dom.setPointerCapture?.(event.pointerId);
+    } catch {
+      /* 某些浏览器不支持 pointer capture，忽略 */
+    }
+    this.onStatus?.('拖动水源修改位置（水平移动）· 松开提交');
+    this.onDraftChange?.(this);
+  }
+
+  _handlePointerMove(event) {
+    // 拖动中：实时把节点挪到地形上（数据在松开时才写回 water）
+    if (this._drag) {
+      const hit = this.cameraControls?.pick?.(event.clientX, event.clientY);
+      if (!hit) return;
+      const drag = this._drag;
+      drag.nextX = hit.x;
+      drag.nextZ = hit.z;
+      const node = this.nodes.get(drag.id);
+      if (node) {
+        node.source = { ...node.source, x: hit.x, z: hit.z };
+        this._positionNode(node);
+      }
+      return;
+    }
+
+    if (this.placement || !this.visible || this.tourHidden) {
+      if (this.dom.style.cursor === 'grab') this.dom.style.cursor = '';
+      return;
+    }
+
+    // 悬停在标记上时给出可拖动的手型光标
+    const hit = this._pickSource(event.clientX, event.clientY);
+    const id = hit?.object?.userData?.sourceId ?? null;
+    if (id !== this._hoverId) {
+      this._hoverId = id;
+      this.dom.style.cursor = id ? 'grab' : '';
+    }
+  }
+
+  _handlePointerUp(event) {
+    if (event.button !== 0) return;
+
+    // ① 拖动结束：提交位置
+    if (this._drag) {
+      const drag = this._drag;
+      this._drag = null;
+      this.cameraControls?.setEnabled?.(true);
+      this.editor?.setPickingEnabled?.(true);
+      try {
+        this.dom.releasePointerCapture?.(event.pointerId);
+      } catch {
+        /* ignore */
+      }
+      this.onStatus?.(null);
+      if (Number.isFinite(drag.nextX) && Number.isFinite(drag.nextZ)) {
+        this.water?.updateSource?.(drag.id, { x: drag.nextX, z: drag.nextZ });
+      } else {
+        this.syncNodes();
+      }
+      this.onDraftChange?.(this);
+      return;
+    }
+
+    // ② 放置模式：区分「点击放点」与「拖视角」
+    if (!this.placement || !this._down) return;
+    const dx = event.clientX - this._down.x;
+    const dy = event.clientY - this._down.y;
+    this._down = null;
+    if (Math.hypot(dx, dy) > CLICK_SLOP) return; // 拖拽视角，不算点击
+
+    const hit = this.cameraControls?.pick?.(event.clientX, event.clientY);
+    if (!hit) {
+      this.onStatus?.('没点在地形上：请在地形范围内点击');
+      return;
+    }
+    const before = this.water?.state?.sources?.length ?? 0;
+    const source = this.water?.addSource?.({ x: hit.x, z: hit.z });
+    const after = this.water?.state?.sources?.length ?? 0;
+    if (source) {
+      this.onStatus?.(
+        after > before
+          ? `已放置水源「${source.name}」· 继续点击可连续放置，Esc 结束`
+          : `水源数量已达上限（${after} 个）· Esc 结束`,
+      );
+    } else {
+      this.onStatus?.('水源创建失败（可能已达水源数量上限）');
+    }
+    this.onDraftChange?.(this);
+  }
+
+  _handleKeyDown(event) {
+    if (!this.placement || event.key !== 'Escape') return;
+    const typing =
+      event.target instanceof HTMLInputElement ||
+      event.target instanceof HTMLTextAreaElement ||
+      event.target instanceof HTMLSelectElement;
+    if (typing) return;
+    event.preventDefault();
+    this.cancel();
+  }
+
+  /** 拾取场景里的水源小球（只用球体，不用圆环，避免沿地面误选） */
+  _pickSource(clientX, clientY) {
+    if (!this.nodes.size) return null;
+    // 游览模式 / 非水体模式下标记是隐藏的：不能 raycast 到（否则会误拖隐藏的水源）
+    if (!this.group.visible) return null;
     const rect = this.dom.getBoundingClientRect();
-    this.nodeRaycaster.setFromCamera(
+    this.raycaster.setFromCamera(
       new THREE.Vector2(
         ((clientX - rect.left) / rect.width) * 2 - 1,
         -(((clientY - rect.top) / rect.height) * 2 - 1),
       ),
       this.camera,
     );
-    const hits = this.nodeRaycaster.intersectObjects(this.nodeMeshes, false);
+    const spheres = [...this.nodes.values()].map((node) => node.sphere);
+    const hits = this.raycaster.intersectObjects(spheres, false);
     return hits[0] ?? null;
-  }
-
-  _startNodeDrag(hit) {
-    const { nodeKind: kind, nodeId: id, nodeIndex: index } = hit.object.userData;
-    if (kind === 'area') {
-      // 静止水面：在水平面内拖动 → 水平位置可变，水面高度保持不变
-      const area = this.system.state.areas.find((a) => a.id === id);
-      const surfaceY = this.system.metersToWorldY(area.level);
-      this._plane.setFromNormalAndCoplanarPoint(
-        new THREE.Vector3(0, 1, 0),
-        new THREE.Vector3(0, surfaceY, 0),
-      );
-    } else {
-      // 流动水：在过该点、朝向相机的平面内拖动 → 空间位置（x/y/z）都可改
-      const normal = new THREE.Vector3();
-      this.camera.getWorldDirection(normal).negate();
-      this._plane.setFromNormalAndCoplanarPoint(normal, hit.object.position.clone());
-    }
-    this._drag = { kind, id, index };
-    this.cameraControls?.setEnabled(false); // 拖节点时不要同时转视角
-    this.editor.setPickingEnabled(false);
-    this.onStatus?.(
-      kind === 'area' ? '拖动节点改水平位置（水面高度不变）· 松开提交' : '拖动节点改空间位置 · 松开提交',
-    );
-  }
-
-  _dragMove(event) {
-    const drag = this._drag;
-    if (!drag) return;
-    const rect = this.dom.getBoundingClientRect();
-    this.nodeRaycaster.setFromCamera(
-      new THREE.Vector2(
-        ((event.clientX - rect.left) / rect.width) * 2 - 1,
-        -(((event.clientY - rect.top) / rect.height) * 2 - 1),
-      ),
-      this.camera,
-    );
-    const point = new THREE.Vector3();
-    if (!this.nodeRaycaster.ray.intersectPlane(this._plane, point)) return;
-    if (drag.kind === 'area') {
-      this.system.moveAreaPoint(drag.id, drag.index, point.x, point.z, false);
-    } else {
-      this.system.moveFlowPoint(drag.id, drag.index, point.x, point.y, point.z, false);
-    }
-    this.syncNodes(); // 节点与序号跟着走
-  }
-
-  _endNodeDrag() {
-    if (!this._drag) return;
-    this._drag = null;
-    this.cameraControls?.setEnabled(true);
-    this.editor.setPickingEnabled(true);
-    this.system.commitChange(); // 一次变更：进撤回栈 + 触发自动保存
-    this.onStatus?.(null);
-  }
-
-  _clearPreview() {
-    for (const child of [...this.preview.children]) {
-      this.preview.remove(child);
-      child.geometry?.dispose();
-      child.element?.remove?.(); // CSS2DObject 的 DOM
-    }
-    for (const material of this._previewMaterials) {
-      this.system.materials?.delete(material);
-      material.dispose();
-    }
-    this._previewMaterials.length = 0;
-  }
-
-  /** 选点在地表上的世界坐标（标记画在这里，而不是水面高度上） */
-  _pointPosition(p, isArea) {
-    const x = Array.isArray(p) ? p[0] : p.x;
-    const z = Array.isArray(p) ? (isArea ? p[1] : p[2]) : p.z;
-    const worldY = Array.isArray(p)
-      ? this.system.metersToWorldY(this.system.groundMetersAt(x, z))
-      : p.y;
-    return new THREE.Vector3(x, worldY + 6, z);
-  }
-
-  _updatePreview() {
-    this._clearPreview();
-    const d = this.drawing;
-    if (!d || !d.points.length) return;
-
-    const isArea = d.type === 'area';
-    const pts = d.points;
-
-    // 每个选点：小球 + 序号，点在哪一目了然
-    pts.forEach((p, index) => {
-      const position = this._pointPosition(p, isArea);
-      const marker = new THREE.Mesh(this.markerGeometry, this.markerMaterial);
-      marker.position.copy(position);
-      marker.renderOrder = 22;
-      this.preview.add(marker);
-
-      const element = document.createElement('div');
-      element.className = 'pick-index';
-      element.textContent = String(index + 1);
-      const label = new CSS2DObject(element);
-      label.position.copy(position).add(new THREE.Vector3(0, 24, 0));
-      this.preview.add(label);
-    });
-
-    if (isArea) {
-      // 边界连线（闭合预览）
-      if (pts.length > 1) {
-        const ring = pts.map((p) => this._pointPosition(p, true));
-        ring.push(ring[0].clone());
-        this.preview.add(
-          new THREE.Line(new THREE.BufferGeometry().setFromPoints(ring), this.lineMaterial),
-        );
-      }
-      // 实时水面：直接用最终区域的材质（波纹 + 雾），所见即所得
-      if (pts.length >= 3) {
-        const shape = new THREE.Shape();
-        pts.forEach(([x, z], i) => (i === 0 ? shape.moveTo(x, -z) : shape.lineTo(x, -z)));
-        const geometry = new THREE.ShapeGeometry(shape);
-        geometry.rotateX(-Math.PI / 2);
-        const mesh = new THREE.Mesh(geometry, this.system.areaMaterial);
-        mesh.position.y = this.system.metersToWorldY(this.averageMeters());
-        mesh.renderOrder = 19;
-        this.preview.add(mesh);
-      }
-    } else {
-      if (pts.length >= 2) {
-        const curve = flowCurve({ points: pts });
-        const linePts = curve.getPoints(Math.max(24, pts.length * 12));
-        this.preview.add(
-          new THREE.Line(new THREE.BufferGeometry().setFromPoints(linePts), this.lineMaterial),
-        );
-
-        // 实时流动水带：与最终流动水同一套材质，同样贴到模型/地形表面
-        const geometry = buildFlowGeometry({ points: pts, width: 14 }, 14, (p) => this.system.surfaceAt(p));
-        const material = this.system.createFlowMaterial();
-        this._previewMaterials.push(material);
-        const ribbon = new THREE.Mesh(geometry, material);
-        ribbon.renderOrder = 19;
-        this.preview.add(ribbon);
-      }
-    }
   }
 }

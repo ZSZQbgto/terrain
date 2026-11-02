@@ -5,8 +5,17 @@
  *   { id, name, assetId, assetName, visible, transform, partTransforms, labels }
  * glb 二进制单独存 IndexedDB（store.js），这里只引用 assetId。
  */
+import { normalizeWaterState as normalizeWater } from '../water/waterState.js';
+
 export const STORAGE_KEY = 'modeldesigner.project.v1';
 export const PROJECT_VERSION = 1;
+
+/**
+ * 水体状态归一化统一由 water 模块提供（与运行时 FluidWater 共用同一套 schema）：
+ * `{ enabled, sim, visual, sources[] }`。旧工程的 areas/flows 会被丢弃，不迁移。
+ * 这里保留 `normalizeWater` 这个导出名，serializeProject 的形状不变。
+ */
+export { normalizeWater };
 
 /** 标签类型：动态结构（可被控制系统驱动）、静态标注（只读说明），以及尚未分类 */
 export const LABEL_KINDS = {
@@ -130,74 +139,6 @@ function normalizePartNames(raw) {
     if (!item || !Array.isArray(item.path) || !item.path.length) continue;
     if (typeof item.name !== 'string' || !item.name) continue;
     out.push({ path: item.path.map((n) => Number(n) | 0), name: item.name });
-  }
-  return out;
-}
-
-/** 水体标签：只有名称，不在场景里显示（与物体标签区分） */
-function normalizeWaterLabels(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((l) => l && typeof l === 'object')
-    .map((l) => ({
-      id: typeof l.id === 'string' ? l.id : uid('wlabel'),
-      title: typeof l.title === 'string' && l.title ? l.title : '未命名水体标签',
-    }));
-}
-
-/** 水面系统：默认平面水位 + 圈定区域 + 流动水路径（都带水体标签） */
-export function normalizeWater(raw) {
-  const out = { enabled: true, level: 69, areas: [], flows: [] };
-  if (!raw || typeof raw !== 'object') return out;
-  out.enabled = raw.enabled !== false;
-  if (Number.isFinite(raw.level)) out.level = Number(raw.level);
-
-  const areas = Array.isArray(raw.areas) ? raw.areas : [];
-  for (const a of areas) {
-    if (!a || !Array.isArray(a.points)) continue;
-    const points = a.points
-      .filter((p) => Array.isArray(p) && p.length === 2 && p.every((n) => Number.isFinite(n)))
-      .map(([x, z]) => [Number(x), Number(z)]);
-    if (points.length < 3) continue;
-    out.areas.push({
-      id: typeof a.id === 'string' ? a.id : uid('area'),
-      name: typeof a.name === 'string' && a.name ? a.name : '水面区域',
-      level: Number.isFinite(a.level) ? Number(a.level) : out.level,
-      points,
-      labels: normalizeWaterLabels(a.labels),
-    });
-  }
-
-  const flows = Array.isArray(raw.flows) ? raw.flows : [];
-  for (const f of flows) {
-    if (!f || !Array.isArray(f.points)) continue;
-    // 关键点：支持 [x,y,z] 旧格式与 { x, y, z, width, dir } 新格式（每点可独立宽度 / 横向朝向）
-    const points = f.points
-      .map((p) => {
-        if (Array.isArray(p) && p.length === 3 && p.every((n) => Number.isFinite(n))) {
-          return { x: Number(p[0]), y: Number(p[1]), z: Number(p[2]), width: null, dir: null };
-        }
-        if (p && typeof p === 'object' && [p.x, p.y, p.z].every((n) => Number.isFinite(n))) {
-          return {
-            x: Number(p.x),
-            y: Number(p.y),
-            z: Number(p.z),
-            width: Number.isFinite(p.width) ? Math.max(0.5, Number(p.width)) : null,
-            dir: Number.isFinite(p.dir) ? Number(p.dir) : null,
-          };
-        }
-        return null;
-      })
-      .filter(Boolean);
-    if (points.length < 2) continue;
-    out.flows.push({
-      id: typeof f.id === 'string' ? f.id : uid('flow'),
-      name: typeof f.name === 'string' && f.name ? f.name : '流动水',
-      speed: Number.isFinite(f.speed) ? Math.max(0.05, Number(f.speed)) : 1,
-      width: Number.isFinite(f.width) ? Math.max(1, Number(f.width)) : 8,
-      points,
-      labels: normalizeWaterLabels(f.labels),
-    });
   }
   return out;
 }

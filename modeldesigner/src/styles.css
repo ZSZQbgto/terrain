@@ -782,3 +782,66 @@ body.tour-mode:active { cursor: grabbing; }
   #panel-water-editor { max-height: 38vh; }
   #hint { white-space: normal; text-align: center; border-radius: 12px; }
 }
+
+/* ── 水体模拟：水源标记 / 只读字段 / 说明文字 / 状态 ─────────────────────── */
+/* CSS2D 水源名称：挂在场景小球的球心上方 */
+.water-source-label {
+  pointer-events: none;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(127, 230, 212, 0.6);
+  background: rgba(12, 40, 38, 0.82);
+  color: #b6f5ea;
+  font: 600 10.5px/1.5 "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+}
+.water-source-label.active {
+  color: #ffe4a3;
+  border-color: rgba(255, 209, 102, 0.85);
+  background: rgba(46, 34, 16, 0.85);
+}
+
+/* 放置水源时（WaterEditor.startPlacement）画布变十字准星 */
+body.water-placing #app { cursor: crosshair; }
+body.water-placing #app::after {
+  content: "放置水源：在地形上点击（可连续放置，Esc 结束）";
+  position: fixed;
+  top: 96px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(127, 230, 212, 0.55);
+  background: rgba(10, 24, 22, 0.82);
+  color: #b6f5ea;
+  font: 11.5px/1.5 "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  pointer-events: none;
+  z-index: 8;
+}
+
+/* 只读字段（地面高程跟随水源位置自动更新） */
+.field .readout {
+  padding: 5px 7px;
+  border-radius: 7px;
+  border: 1px dashed var(--stroke);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--dim);
+  font-size: 11px;
+}
+
+/* 面板里的说明文字 */
+.hint-line { font-size: 10.5px; color: var(--dim); line-height: 1.55; }
+
+/* 水体面板底部：模拟步数 / 水源数 */
+.water-stats {
+  font-size: 10.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 水源列表元信息（地面高程 · 半径）在窄面板里可以收缩 */
+#water-list .model-item .meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
