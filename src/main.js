@@ -321,6 +321,7 @@ async function main() {
     const k = clampSetting(value, 1, 8, 1.8);
     terrain.setExaggeration(k);
     ui?.setExaggerationState(k);
+    terrainEditor?.refreshIndicator?.(); // 笔刷指示圈贴地高度随夸张变化
     patchSettings({ exaggeration: k });
   };
 
@@ -393,6 +394,8 @@ async function main() {
     domElement: renderer.domElement,
     cameraControls,
     editor,
+    scene,
+    getExaggeration: () => env.uExaggeration.value,
     hasSavedEdits: savedTerrain.restored,
     onEdit: () => {
       lookupDirty = true;
@@ -515,9 +518,11 @@ async function main() {
     tourOn = next;
     ui?.setTourState(tourOn);
     waterEditor.setTourHidden(tourOn); // 游览模式隐藏水源标记（小球 / 圆环）
+    if (tourOn) terrainEditor?.indicator?.hide(); // 游览模式不显示笔刷指示圈
+    else terrainEditor?.refreshIndicator?.();
     cameraControls.setInertia(tourOn);
     if (tourOn) {
-      ui?.toast('游览模式：拖动旋转 · 滚轮缩放 · WASD 平移（带惯性）· Esc 退出');
+      ui?.toast('游览模式：左键平移 · 中键旋转 · 右键（左右旋转 / 上下缩放）· 滚轮缩放 · WASD 平移 · Q/E 升降 · Shift 加速 / Ctrl 缓动（带惯性）· Esc 退出');
     } else {
       ui?.resetHint?.();
     }
@@ -681,6 +686,7 @@ async function main() {
     terrain.updateLOD(camera, window.innerHeight);
     satellite?.update(camera); // 地形贴图：按块到相机距离切换三档瓦片
     tagLayer.update(); // 部件标签跟随 gizmo / 数值编辑移动
+    terrainEditor?.updateHover?.(); // 地形编辑：相机移动时笔刷指示圈仍贴在光标下的地形上
     flushLookupIfDue(); // 地形编辑后：节流重建 AO / 梯度查询纹理（高度已实时更新）
 
     fxaa.render(scene, camera);

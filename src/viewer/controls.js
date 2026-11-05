@@ -1,6 +1,14 @@
 /**
- * 自由浏览控制：轨道相机（鼠标/触摸）+ WASD/QE 飞行 + 双击聚焦 + 射线步进拾取。
+ * 自由浏览控制：轨道相机 + WASD 飞行 + 双击聚焦 + 射线步进拾取。
  * 始终把相机托在地表之上，避免钻进山体。
+ *
+ * 统一后的交互（模型编辑 / 水体编辑 / 地形编辑 / 游览都用同一套）：
+ *   - 左键拖动            平移（在地形编辑里落在地形上时优先涂抹，相机让位）
+ *   - 中键拖动            绕观察中心旋转
+ *   - 右键拖动            横向 = 绕观察中心旋转，纵向 = 缩放
+ *   - 滚轮                上滚放大、下滚缩小（朝光标缩放）
+ *   - W/A/S/D             水平前后左右移动（Shift 加速 3.2×，Ctrl/⌘ 缓动 0.25×）
+ *   - Q / E               降低 / 抬高视角高度
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -33,6 +41,69 @@ export class TerrainControls {
     this.controls.target.set(0, 0, 0);
     this.controls.zoomToCursor = true;
 
+    // ── 统一鼠标映射 ────────────────────────────────────────────────────────
+    // 左键拖动 = 平移；中键拖动 = 绕中心旋转；右键由本类自定义（横向旋转 + 纵向缩放）。
+    this.controls.mouseButtons = {
+      LEFT: THREE.MOUSE.PAN,
+      MIDDLE: THREE.MOUSE.ROTATE,
+      RIGHT: null,
+    };
+    // OrbitControls 在 ROTATE/PAN 动作里会把 Ctrl/Shift/⌘ 变成另一种动作；
+    // 本项目 Shift/Ctrl 是键盘移动的加速/缓动修饰键（不改变鼠标语义），
+    // 这里屏蔽掉它内置的修饰键切换，保证按住 Shift/Ctrl 时左键仍稳定 = 平移。
+    if (typeof this.controls._onMouseDown === 'function') {
+      const originalMouseDown = this.controls._onMouseDown;
+      this.controls._onMouseDown = (event) =>
+        originalMouseDown({
+          button: event.button,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          pointerId: event.pointerId,
+          pointerType: event.pointerType,
+          ctrlKey: false,
+          metaKey: false,
+          shiftKey: false,
+        });
+    }
+
+    // ── 右键拖动：横向绕中心旋转、纵向缩放 ──────────────────────────────────
+    this._rightDrag = null;
+    this._onRightDown = (event) => {
+      if (event.button !== 2 || !this.enabled) return;
+      event.preventDefault();
+      this._rightDrag = { pointerId: event.pointerId, lastX: event.clientX, lastY: event.clientY };
+      try {
+        this.dom.setPointerCapture?.(event.pointerId);
+      } catch {
+        /* 某些浏览器不支持 pointer capture，忽略 */
+      }
+    };
+    this._onRightMove = (event) => {
+      const drag = this._rightDrag;
+      if (!drag || !this.enabled || event.pointerId !== drag.pointerId) return;
+      const dx = event.clientX - drag.lastX;
+      const dy = event.clientY - drag.lastY;
+      drag.lastX = event.clientX;
+      drag.lastY = event.clientY;
+      if (dx || dy) this._rightDragCamera(dx, dy);
+    };
+    this._onRightUp = (event) => {
+      const drag = this._rightDrag;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      this._rightDrag = null;
+      try {
+        this.dom.releasePointerCapture?.(event.pointerId);
+      } catch {
+        /* ignore */
+      }
+    };
+    this._onContextMenu = (event) => event.preventDefault();
+    this.dom.addEventListener('pointerdown', this._onRightDown);
+    window.addEventListener('pointermove', this._onRightMove);
+    window.addEventListener('pointerup', this._onRightUp);
+    window.addEventListener('pointercancel', this._onRightUp);
+    this.dom.addEventListener('contextmenu', this._onContextMenu);
+
     this.keys = new Set();
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2(0, 0);
@@ -43,10 +114,11 @@ export class TerrainControls {
     this._desired = new THREE.Vector3();
     this._move = new THREE.Vector3();
     this.collisionEnabled = true; // 相机碰撞：不钻地、不出地形边界
-    this.modifiers = { shift: false, ctrl: false }; // Ctrl=缓动，Shift=加速
+    // Shift = 加速（3.2×），Ctrl/⌘ = 缓动（0.25×），只影响 WASD / QE 的移动速度
+    this.modifiers = { shift: false, ctrl: false };
     this._onKeyDown = (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
-      // 修饰键单独记录：它们不在 KEY_SPEED 里，之前放进 keys 集合的方式永远读不到
+      // 修饰键单独记录：它们不在 KEY_SPEED 里
       this.modifiers.shift = e.shiftKey;
       this.modifiers.ctrl = e.ctrlKey || e.metaKey;
       if (KEY_SPEED[e.code]) {
@@ -89,7 +161,10 @@ export class TerrainControls {
   setEnabled(on) {
     this.enabled = on;
     this.controls.enabled = on;
-    if (!on) this.keys.clear();
+    if (!on) {
+      this.keys.clear();
+      this._rightDrag = null;
+    }
   }
 
   /** 相机碰撞开关：关掉后允许钻到地形以下、飞出地形边界 */
@@ -186,12 +261,42 @@ export class TerrainControls {
     this.camera.position.copy(this.controls.target).addScaledVector(dir, Math.min(distance, this.camera.position.distanceTo(this.controls.target)));
   }
 
+  /**
+   * 右键拖动：横向（dx）绕观察中心旋转，纵向（dy）缩放（向上拖 = 放大）。
+   * 直接改 camera.position 的球坐标；OrbitControls.update 会按 min/maxDistance、
+   * maxPolarAngle 再夹一次，所以和滚轮 / 中键旋转的手感、边界一致。
+   */
+  _rightDragCamera(dx, dy) {
+    const target = this.controls.target;
+    const offset = new THREE.Vector3().subVectors(this.camera.position, target);
+    const spherical = new THREE.Spherical().setFromVector3(offset);
+    const viewportHeight = Math.max(200, this.dom.clientHeight || 800);
+
+    // 横向：与 OrbitControls 中键旋转相同的角速度公式（2π * dx / viewportH * rotateSpeed）
+    spherical.theta -= (2 * Math.PI * dx * this.controls.rotateSpeed) / viewportHeight;
+    // 纵向：按指数缩放距离（向上拖 = 拉近放大，向下拖 = 拉远缩小）
+    spherical.radius *= Math.exp(dy * 0.0025 * (this.controls.zoomSpeed || 1));
+    spherical.radius = Math.min(
+      this.controls.maxDistance,
+      Math.max(this.controls.minDistance, spherical.radius),
+    );
+
+    spherical.makeSafe();
+    const phiMin = Math.max(0.02, this.controls.minPolarAngle || 0.02);
+    const phiMax = Math.min(Math.PI - 0.02, this.controls.maxPolarAngle || Math.PI - 0.02);
+    spherical.phi = Math.min(phiMax, Math.max(phiMin, spherical.phi));
+
+    offset.setFromSpherical(spherical);
+    this.camera.position.copy(target).add(offset);
+  }
+
   update(dt) {
     if (this.enabled) {
       const c = this.camera;
       const target = this.controls.target;
       let forward = 0;
       let right = 0;
+      // Q = 降低视角，E = 抬高视角（与最初的操作一致）
       let up = 0;
       if (this.keys.has('KeyW')) forward += 1;
       if (this.keys.has('KeyS')) forward -= 1;
@@ -201,7 +306,7 @@ export class TerrainControls {
       if (this.keys.has('KeyQ')) up -= 1;
 
       const dtClamped = Math.min(dt, 0.05);
-      // 期望速度（单位/秒）：Ctrl（⌘）= 缓动精细移动，Shift = 加速
+      // 期望速度（单位/秒）：随观察距离自适应；Shift = 加速 3.2×，Ctrl（⌘）= 缓动 0.25×
       this._desired.set(0, 0, 0);
       if (forward || right || up) {
         const dist = c.position.distanceTo(target);
@@ -268,6 +373,11 @@ export class TerrainControls {
     window.removeEventListener('keydown', this._onKeyDown);
     window.removeEventListener('keyup', this._onKeyUp);
     window.removeEventListener('blur', this._onBlur);
+    this.dom.removeEventListener('pointerdown', this._onRightDown);
+    window.removeEventListener('pointermove', this._onRightMove);
+    window.removeEventListener('pointerup', this._onRightUp);
+    window.removeEventListener('pointercancel', this._onRightUp);
+    this.dom.removeEventListener('contextmenu', this._onContextMenu);
     this.controls.dispose();
   }
 }

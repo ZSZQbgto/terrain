@@ -28,7 +28,7 @@ const WATER_HINT =
 
 /** 地形编辑模式的默认提示 */
 const TERRAIN_HINT =
-  '按住左键在地形上涂抹：升高 / 降低 / 平整 / 平滑 · 滚轮缩放 · 右键平移 · Ctrl+Z 撤销 · Esc 结束当前笔画';
+  '左键涂抹 · 中键拖动旋转 · 右键拖动：左右旋转 / 上下缩放 · 滚轮缩放 · WASD 平移 · Q/E 升降 · Shift 加速 / Ctrl 缓动 · Ctrl+Z 撤销 · Esc 结束笔画';
 
 /** 地形笔刷板的兜底默认值（正常情况下直接用引擎回传的 state） */
 const TERRAIN_BRUSH_FALLBACK = { tool: 'raise', radius: 80, strength: 0.3 };
@@ -270,7 +270,7 @@ export class Ui {
           </div>
           <div class="terrain-status" data-role="terrain-status"></div>
           <div class="hint-line">
-            按住左键在地形上涂抹…（滚轮缩放 · 右键平移 · Esc 结束当前笔画）
+            按住左键在地形上涂抹（指示圈跟随落点）· 中键拖动旋转 · 右键拖动：左右旋转 / 上下缩放 · Q/E 升降 · Shift 加速 / Ctrl 缓动
           </div>
         </div>
       </div>
@@ -1416,7 +1416,7 @@ export class Ui {
           <span style="font-weight:400;color:var(--dim)">可连续放置</span>
         </div>
         <div class="hint-line">
-          在地形上点击放置水源（左键拖动仍然是转视角，不会误放点）。Esc 或下方按钮结束放置。
+          在地形上点击放置水源（左键拖动是相机平移，不会误放点）。Esc 或下方按钮结束放置。
         </div>
         <button class="btn small primary" data-act="water-placement-end">结束放置</button>
       `;

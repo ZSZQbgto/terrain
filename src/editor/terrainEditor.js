@@ -13,6 +13,7 @@
  */
 import { encodeHeightPng, normalizeSourceRange } from '../terrain/heightPng.js';
 import { deleteWorld, getWorld, putWorld } from './store.js';
+import { BrushIndicator } from './brushIndicator.js';
 
 const SAVE_KEY = 'terrain-edit-v1';
 const UNDO_LIMIT = 8;
@@ -74,6 +75,8 @@ export class TerrainEditor {
     domElement,
     cameraControls,
     editor,
+    scene = null,
+    getExaggeration = null,
     hasSavedEdits = false,
     onEdit,
     onStrokeEnd,
@@ -104,15 +107,29 @@ export class TerrainEditor {
     this._raf = 0;
     this._saveTimer = 0;
     this._lastFlattenTarget = 0;
+    this._hover = null;
+    this._lastPointer = null;
+    this._hoverAt = 0;
+
+    // 笔刷落点指示圈：跟随鼠标并贴着地形起伏绘制
+    this.indicator = scene
+      ? new BrushIndicator({
+          scene,
+          heightField,
+          getExaggeration: getExaggeration ?? (() => this.cameraControls?.getExaggeration?.() ?? 1),
+        })
+      : null;
 
     this._onPointerDown = this._onPointerDown.bind(this);
     this._onPointerMove = this._onPointerMove.bind(this);
     this._onPointerUp = this._onPointerUp.bind(this);
+    this._onPointerLeave = this._onPointerLeave.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
     this._tick = this._tick.bind(this);
 
     this.dom.addEventListener('pointerdown', this._onPointerDown);
     this.dom.addEventListener('pointermove', this._onPointerMove);
+    this.dom.addEventListener('pointerleave', this._onPointerLeave);
     window.addEventListener('pointerup', this._onPointerUp);
     window.addEventListener('pointercancel', this._onPointerUp);
     window.addEventListener('keydown', this._onKeyDown);
@@ -160,13 +177,26 @@ export class TerrainEditor {
       // 地形编辑模式下点击画布用于涂抹，不参与模型选择；清掉当前选择避免 gizmo 抢指针
       this.editor?.clearSelection?.();
       this.editor?.setPickingEnabled?.(false);
+      this._hover = null;
+      this.indicator?.hide();
       this.onStatus?.(null); // 用法提示在面板 note / 底部 hint 里，不在状态行重复
     } else {
       this._cancelStroke({ keepChanges: true });
+      this._hover = null;
+      this.indicator?.hide();
       this.editor?.setPickingEnabled?.(true);
       this.onStatus?.(null);
     }
     this._emitState();
+  }
+
+  /** 垂直夸张 / 地形高度变化后刷新指示圈位置（贴地高度会变） */
+  refreshIndicator() {
+    if (!this.active || !this._hover || document.body.classList.contains('tour-mode')) {
+      this.indicator?.hide();
+      return;
+    }
+    this.indicator?.update(this._hover.x, this._hover.z, this.radius);
   }
 
   setTool(tool) {
@@ -177,6 +207,7 @@ export class TerrainEditor {
 
   setRadius(meters) {
     this.radius = clamp(meters, RADIUS_MIN, RADIUS_MAX, this.radius);
+    this.refreshIndicator();
     this._emitState();
   }
 
@@ -228,6 +259,71 @@ export class TerrainEditor {
     return this._dirtyMask;
   }
 
+  /**
+   * 平滑工具：对笔刷包围盒（外扩 blurRadius）做一次可分离盒式模糊，返回该区域的模糊高度。
+   * 水平/垂直各一次滑动平均，复杂度 O(区域面积)，比逐纹素 3×3 采样更强也更快。
+   * 边缘按 clamp 取样，地形边界处不会出现暗边。
+   *
+   * @returns {{x0:number, y0:number, bw:number, data:Float32Array}}
+   */
+  _computeSmoothRegion(x0, x1, y0, y1, blurRadius) {
+    const hf = this.heightField;
+    const W = hf.width;
+    const H = hf.height;
+    const normalized = hf.ensureNormalized();
+    const rad = Math.max(1, Math.round(blurRadius));
+
+    const ex0 = Math.max(0, x0 - rad);
+    const ex1 = Math.min(W - 1, x1 + rad);
+    const ey0 = Math.max(0, y0 - rad);
+    const ey1 = Math.min(H - 1, y1 + rad);
+    const bw = ex1 - ex0 + 1;
+    const bh = ey1 - ey0 + 1;
+    const win = rad * 2 + 1;
+    const need = bw * bh;
+
+    // 复用的临时缓冲，避免每次涂抹都分配（大笔刷时区域约几万纹素）
+    if (!this._blurRows || this._blurRows.length < need) this._blurRows = new Float32Array(need);
+    if (!this._blurOut || this._blurOut.length < need) this._blurOut = new Float32Array(need);
+    const rows = this._blurRows;
+    const out = this._blurOut;
+
+    // ① 水平方向滑动平均
+    for (let y = ey0; y <= ey1; y++) {
+      const row = y * W;
+      const outRow = (y - ey0) * bw;
+      let sum = 0;
+      for (let k = -rad; k <= rad; k++) {
+        const xx = Math.min(W - 1, Math.max(0, ex0 + k));
+        sum += normalized[row + xx];
+      }
+      for (let x = ex0; x <= ex1; x++) {
+        rows[outRow + (x - ex0)] = sum / win;
+        const xa = Math.min(W - 1, Math.max(0, x - rad));
+        const xb = Math.min(W - 1, Math.max(0, x + rad + 1));
+        sum += normalized[row + xb] - normalized[row + xa];
+      }
+    }
+
+    // ② 垂直方向滑动平均（区域已外扩 rad，不会越界）
+    for (let x = ex0; x <= ex1; x++) {
+      const col = x - ex0;
+      let sum = 0;
+      for (let k = -rad; k <= rad; k++) {
+        const yy = Math.min(ey1, Math.max(ey0, ey0 + k));
+        sum += rows[(yy - ey0) * bw + col];
+      }
+      for (let y = ey0; y <= ey1; y++) {
+        out[(y - ey0) * bw + col] = sum / win;
+        const ya = Math.min(ey1, Math.max(ey0, y - rad));
+        const yb = Math.min(ey1, Math.max(ey0, y + rad + 1));
+        sum += rows[(yb - ey0) * bw + col] - rows[(ya - ey0) * bw + col];
+      }
+    }
+
+    return { x0: ex0, y0: ey0, bw, data: out };
+  }
+
   /** 笔刷核心：在 (x,z)（米，世界坐标）处按当前工具施加一次笔刷 */
   _applyBrush(x, z, { tool, radius, strength, dt, flattenTarget }) {
     const hf = this.heightField;
@@ -253,6 +349,15 @@ export class TerrainEditor {
     // 每秒最大变化量：strength=1 时约 0.72/s（≈满量程 1.4 秒），60fps 下每帧约 1.2%
     const deltaPerSecond = power * 1.2;
     const blendPerSecond = power * 2.6;
+    // 平滑：先对笔刷区域做一次「可分离盒式模糊」，再把每个纹素向模糊值收敛。
+    // 模糊半径按笔刷半径取 ~45%（2–14 texel），比 3×3 均值强得多 —— 强度拉满时
+    // 一两秒的涂抹就能明显抹平起伏；收敛速度也随强度提高（100% 时中心每帧约 18%）。
+    const smoothRate = 1.8 + power * 9;
+    let smoothRegion = null;
+    if (tool === 'smooth') {
+      const blurRadius = Math.max(2, Math.min(14, Math.round(rTex * 0.45)));
+      smoothRegion = this._computeSmoothRegion(x0, x1, y0, y1, blurRadius);
+    }
     let changed = false;
     let changedCount = 0;
 
@@ -278,20 +383,10 @@ export class TerrainEditor {
           const target = flattenTarget ?? current;
           const alpha = Math.min(1, blendPerSecond * step * falloff);
           next = current + (target - current) * alpha;
-        } else if (tool === 'smooth') {
-          // 以 3×3 邻域均值做局部平滑（边缘按 clamp 取样）
-          let sum = 0;
-          let n = 0;
-          for (let oy = -1; oy <= 1; oy++) {
-            const sy = Math.min(H - 1, Math.max(0, iy + oy)) * W;
-            for (let ox = -1; ox <= 1; ox++) {
-              const sx = Math.min(W - 1, Math.max(0, ix + ox));
-              sum += normalized[sy + sx];
-              n++;
-            }
-          }
-          const alpha = Math.min(1, blendPerSecond * step * falloff);
-          next = current + (sum / n - current) * alpha;
+        } else if (tool === 'smooth' && smoothRegion) {
+          const blurred = smoothRegion.data[(iy - smoothRegion.y0) * smoothRegion.bw + (ix - smoothRegion.x0)];
+          const alpha = Math.min(1, smoothRate * step * falloff);
+          next = current + (blurred - current) * alpha;
         }
 
         if (next < 0) next = 0;
@@ -343,6 +438,7 @@ export class TerrainEditor {
     this.heightField.applyNormalizedArray(snapshot);
     this._recomputeDirty();
     this.editCount = Math.max(0, this.editCount - 1);
+    this.refreshIndicator();
     this.onEdit?.(this.getState());
     this.onStrokeEnd?.(this.getState());
     this._saveSoon();
@@ -360,6 +456,7 @@ export class TerrainEditor {
     this._dirtyCount = 0;
     this._edited = false;
     this.editCount = 0;
+    this.refreshIndicator();
     this.onEdit?.(this.getState());
     this.onStrokeEnd?.(this.getState());
     this.saveNow().catch(() => {});
@@ -381,6 +478,8 @@ export class TerrainEditor {
     event.preventDefault();
     this._ensureReady();
     this._pushUndo();
+    this._hover = { x: hit.x, z: hit.z };
+    this.indicator?.update(hit.x, hit.z, this.radius);
     this._stroke = {
       pointerId: event.pointerId,
       x: hit.x,
@@ -401,11 +500,55 @@ export class TerrainEditor {
   }
 
   _onPointerMove(event) {
-    if (!this.active || !this._stroke) return;
+    if (!this.active) return;
+    this._lastPointer = { clientX: event.clientX, clientY: event.clientY };
+    if (document.body.classList.contains('tour-mode')) {
+      this.indicator?.hide();
+      return;
+    }
+    // 悬停：指示圈跟随鼠标落点并贴着地形；按下拖动时同时更新笔刷位置
     const hit = this.cameraControls?.pick?.(event.clientX, event.clientY);
-    if (!hit) return;
-    this._stroke.x = hit.x;
-    this._stroke.z = hit.z;
+    if (!hit) {
+      this._hover = null;
+      this.indicator?.hide();
+      return;
+    }
+    this._hover = { x: hit.x, z: hit.z };
+    this.indicator?.update(hit.x, hit.z, this.radius);
+    if (this._stroke) {
+      this._stroke.x = hit.x;
+      this._stroke.z = hit.z;
+    }
+  }
+
+  /**
+   * 每帧（节流 ~70ms）用最近一次鼠标屏幕位置重新拾取地形：
+   * 相机在移动（滚轮 / WASD / 拖动阻尼）时，指示圈也能始终待在光标下的地形上。
+   */
+  updateHover() {
+    if (!this.active || this._stroke || !this._lastPointer) return;
+    if (document.body.classList.contains('tour-mode')) {
+      this.indicator?.hide();
+      return;
+    }
+    const now = performance.now();
+    if (now - (this._hoverAt ?? 0) < 70) return;
+    this._hoverAt = now;
+    const hit = this.cameraControls?.pick?.(this._lastPointer.clientX, this._lastPointer.clientY);
+    if (!hit) {
+      this._hover = null;
+      this.indicator?.hide();
+      return;
+    }
+    this._hover = { x: hit.x, z: hit.z };
+    this.indicator?.update(hit.x, hit.z, this.radius);
+  }
+
+  /** 鼠标离开画布：隐藏指示圈（进入左右面板时也适用） */
+  _onPointerLeave() {
+    this._lastPointer = null;
+    this._hover = null;
+    this.indicator?.hide();
   }
 
   _tick(now) {
@@ -419,6 +562,8 @@ export class TerrainEditor {
     if (!stroke) return;
     const dt = Math.min(0.05, Math.max(0.001, (now - stroke.lastTime) / 1000));
     stroke.lastTime = now;
+    this._hover = { x: stroke.x, z: stroke.z };
+    this.indicator?.update(stroke.x, stroke.z, this.radius);
     const changed = this._applyBrush(stroke.x, stroke.z, {
       tool: this.tool,
       radius: this.radius,
@@ -538,8 +683,10 @@ export class TerrainEditor {
     clearTimeout(this._saveTimer);
     this.dom.removeEventListener('pointerdown', this._onPointerDown);
     this.dom.removeEventListener('pointermove', this._onPointerMove);
+    this.dom.removeEventListener('pointerleave', this._onPointerLeave);
     window.removeEventListener('pointerup', this._onPointerUp);
     window.removeEventListener('pointercancel', this._onPointerUp);
     window.removeEventListener('keydown', this._onKeyDown);
+    this.indicator?.dispose();
   }
 }

@@ -57,8 +57,8 @@ Web 服务器（`127.0.0.1:53831`）。
   `scripts/build-model-index.mjs`、`scripts/make-sample-glb.mjs`。
 - **UI**：顶栏固定为 项目管理 / 模型编辑 / 水体编辑 / 地形编辑 / 图形选项 / 游览；显示类控件
   （贴图、碰撞、水面、标签显示、薄雾强度、垂直夸张、分层数、等高线、近景高清块数、GPU 名）
-  放在「图形选项」，由 `src/editor/ui.js` + `src/main.js` 接线。
-- **地形编辑**：`src/editor/terrainEditor.js`、`src/terrain/heightPng.js`、`src/terrain/heightfield.js`
+  放在「图形选项」，由 `src/editor/ui.js` + `src/main.js` 接线。相机手势以 `src/viewer/controls.js` 为唯一来源（左键平移 / 中键旋转 / 右键旋转+缩放 / 滚轮朝光标缩放 / WASD 平移 + Q/E 升降、Shift 加速 3.2× / Ctrl 缓动 0.25×；修饰键不改变鼠标语义）。
+- **地形编辑**：`src/editor/terrainEditor.js`、`src/editor/brushIndicator.js`（落点指示圈）、`src/terrain/heightPng.js`、`src/terrain/heightfield.js`
   （编辑态 / 原始 half / sourceRange）；结果**不进工程 JSON**，保存/分享：导出灰度 PNG → 重命名 `heightmap64.png` 放回 `resourses/` → `npm run assets`。
 - **文档**：改工程 JSON 字段/单位/坐标约定时同步更新 `docs/EXPORT-FORMAT.md`；
   改命令、路径、行为时同步更新 `README.md`。

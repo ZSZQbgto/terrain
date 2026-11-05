@@ -19,12 +19,21 @@
  *   [H] 地形编辑：模式 / 面板 / 引擎 API / 实时渲染（uHeight 路径 + 编辑前后截图）/
  *       真实鼠标拖拽 / 撤销 / 恢复原始 / 16-bit 灰度 PNG 导出（字节解码 + 像素值）/
  *       UI 导出下载 / IndexedDB 持久化（刷新恢复，测试后清理）
+ *   [I] 统一相机手势 + 笔刷指示圈：LEFT 平移 / MIDDLE 旋转 / RIGHT 横转纵缩 / 滚轮 /
+ *       WASD + Q/E 升降 / Shift 加速·Ctrl 缓动（修饰键不再切换鼠标动作）；地形模式下左键涂抹不平移；
+ *       指示圈 brush-indicator 贴地 / 跟随光标 / 半径联动 / 面板·游览·模式切换隐藏 /
+ *       updateHover 相机移动后重新拾取
+ *   [J] 平滑笔刷（可分离盒式模糊）：注入确定性 ±0.02 高频噪声 → 强度 100%/60 帧与
+ *       30%/30 帧的局部粗糙度 / 最大台阶下降阈值、数值 finite、UI smooth 工具 + 强度滑杆
+ *       + 真实左键拖动涂抹、undo 回噪声基线、resetToOriginal 回原始基线、raise/flatten 未受影响
  *
  * 约定：
  *   - 只使用 5199（dev）/ 5198（preview）端口，绝不碰 5173 / 5174 / DSH 的 53831。
  *   - 只结束自己 spawn 的进程（taskkill /PID <pid> /T /F），绝不按名字杀 node。
  *   - 只写 tests/out/（截图 + 报告）；public/data 与 dist 的改动是资产守卫/构建的正常产物。
  *   - 失败以非零退出码结束。
+ *   - [I] 为保证手势断言确定性，测试期间设置 cameraControls.controls.enableDamping=false
+ *     （headless SwiftShader 帧率低，OrbitControls 平移惯性会泄漏到下一个手势），结束后恢复 true。
  *
  * 可选环境变量：
  *   CHROME_PATH=...       指定 Chrome/Edge 可执行文件
@@ -32,6 +41,8 @@
  *   VERIFY_SKIP_AUTOGEN=1 跳过 [E] 缺失资产自动生成（很慢，约数分钟）
  *   VERIFY_SKIP_PREVIEW=1 跳过 [G] preview 校验
  *   VERIFY_SKIP_TERRAIN=1 跳过 [H] 地形编辑 / 导出 / 持久化（调试用）
+ *   VERIFY_SKIP_CONTROLS=1 跳过 [I] 相机手势 / 笔刷指示圈（调试用）
+ *   VERIFY_SKIP_SMOOTH=1  跳过 [J] 平滑笔刷专项（调试用）
  *   VERIFY_KEEP_OUT=1     清理 tests/out 时保留旧截图（默认只删本项目生成的 merged-*.png）
  *
  * 输出：
@@ -48,6 +59,9 @@
  *   tests/out/merged-09-terrain-realtime.png 编辑后立即（geometry）
  *   tests/out/merged-10-terrain-settled.png 着色重建后
  *   tests/out/merged-11-terrain-persisted.png 刷新后持久化
+ *   tests/out/merged-12-camera-gestures.png 相机手势后
+ *   tests/out/merged-13-indicator.png 地形编辑笔刷指示圈
+ *   tests/out/merged-15-smooth.png  平滑笔刷效果（近景）
  *   tests/out/downloads/*.png       UI 导出下载的 16-bit 灰度 PNG
  */
 import { spawn, spawnSync } from 'node:child_process';
@@ -92,6 +106,8 @@ const SKIP_BUILD = process.env.VERIFY_SKIP_BUILD === '1';
 const SKIP_AUTOGEN = process.env.VERIFY_SKIP_AUTOGEN === '1';
 const SKIP_PREVIEW = process.env.VERIFY_SKIP_PREVIEW === '1';
 const SKIP_TERRAIN = process.env.VERIFY_SKIP_TERRAIN === '1';
+const SKIP_CONTROLS = process.env.VERIFY_SKIP_CONTROLS === '1';
+const SKIP_SMOOTH = process.env.VERIFY_SKIP_SMOOTH === '1';
 
 const SHOT_MAIN = path.join(OUT, 'merged-01-main.png');
 const SHOT_GRAPHICS = path.join(OUT, 'merged-02-graphics.png');
@@ -103,6 +119,9 @@ const SHOT_TERRAIN_BEFORE = path.join(OUT, 'merged-08-terrain-before.png');
 const SHOT_TERRAIN_REALTIME = path.join(OUT, 'merged-09-terrain-realtime.png');
 const SHOT_TERRAIN_SETTLED = path.join(OUT, 'merged-10-terrain-settled.png');
 const SHOT_TERRAIN_PERSISTED = path.join(OUT, 'merged-11-terrain-persisted.png');
+const SHOT_CAMERA = path.join(OUT, 'merged-12-camera-gestures.png');
+const SHOT_INDICATOR = path.join(OUT, 'merged-13-indicator.png');
+const SHOT_SMOOTH = path.join(OUT, 'merged-15-smooth.png');
 const DOWNLOAD_DIR = path.join(OUT, 'downloads');
 const TERRAIN_DEM_SIZE = 1081;
 const SAT_GRAY_MIN = 12596;
@@ -424,15 +443,75 @@ function sameDataSummary(a, b) {
   );
 }
 
-function restoreDataBackup() {
-  if (!existsSync(BACKUP_DIR)) return { restored: false, reason: '无备份' };
+/**
+ * 逐项把 public/data 内容 moved 到备份目录。
+ * 背景：外部 dev server（例如用户自己开的 5173）的 watcher 可能持有 public/data 目录句柄，
+ * Windows 下 rename 整个目录会 EPERM，但 rename 文件 / sat 子目录不受影响。
+ */
+function moveDataEntriesAside() {
+  mkdirSync(BACKUP_DIR, { recursive: true });
+  for (const name of readdirSync(DATA_DIR)) {
+    renameSync(path.join(DATA_DIR, name), path.join(BACKUP_DIR, name));
+  }
+}
+
+/** 删除 data 下的生成内容（保留目录本身，避免外部 watcher 句柄导致目录删除 EPERM），再把备份内容移回 */
+function restoreBackupEntries() {
+  for (const name of readdirSync(DATA_DIR)) {
+    rmSync(path.join(DATA_DIR, name), { recursive: true, force: true });
+  }
+  for (const name of readdirSync(BACKUP_DIR)) {
+    renameSync(path.join(BACKUP_DIR, name), path.join(DATA_DIR, name));
+  }
+  rmSync(BACKUP_DIR, { recursive: true, force: true });
+  return { restored: true, mode: 'entries' };
+}
+
+/** 把 public/data 移走：优先整目录 rename；被外部 dev server watcher 占用时退化为逐项 move */
+function moveDataAside() {
   try {
-    if (existsSync(DATA_DIR)) rmSync(DATA_DIR, { recursive: true, force: true });
-    renameSync(BACKUP_DIR, DATA_DIR);
-    return { restored: true };
+    renameSync(DATA_DIR, BACKUP_DIR);
+    return { ok: true, mode: 'directory', backup: BACKUP_DIR };
+  } catch (err) {
+    const firstError = String(err?.message ?? err);
+    try {
+      moveDataEntriesAside();
+      return { ok: true, mode: 'entries', firstError, backup: BACKUP_DIR };
+    } catch (err2) {
+      return { ok: false, mode: null, firstError, error: String(err2?.message ?? err2) };
+    }
+  }
+}
+
+function restoreDataAside(mode) {
+  if (!existsSync(BACKUP_DIR)) return { restored: false, reason: '无备份' };
+  if (!existsSync(DATA_DIR)) {
+    try {
+      renameSync(BACKUP_DIR, DATA_DIR);
+      return { restored: true, mode: 'directory' };
+    } catch (err) {
+      return { restored: false, error: String(err?.message ?? err) };
+    }
+  }
+  if (mode === 'directory') {
+    try {
+      rmSync(DATA_DIR, { recursive: true, force: true });
+      renameSync(BACKUP_DIR, DATA_DIR);
+      return { restored: true, mode: 'directory' };
+    } catch (err) {
+      log(`[warn] 恢复 public/data 目录 rename 失败（${err?.code ?? ''} ${err?.message ?? err}），改用逐项恢复`);
+    }
+  }
+  try {
+    return restoreBackupEntries();
   } catch (err) {
     return { restored: false, error: String(err?.message ?? err) };
   }
+}
+
+function restoreDataBackup() {
+  if (!existsSync(BACKUP_DIR)) return { restored: false, reason: '无备份' };
+  return restoreDataAside(existsSync(DATA_DIR) ? 'entries' : 'directory');
 }
 
 function analyzeShot(file) {
@@ -902,7 +981,7 @@ async function preflight(env) {
   });
 
   env.ports = { dev: DEV_PORT, preview: PREVIEW_PORT, forbidden: [5173, 5174, 53831] };
-  env.flags = { skipBuild: SKIP_BUILD, skipAutogen: SKIP_AUTOGEN, skipPreview: SKIP_PREVIEW, skipTerrain: SKIP_TERRAIN };
+  env.flags = { skipBuild: SKIP_BUILD, skipAutogen: SKIP_AUTOGEN, skipPreview: SKIP_PREVIEW, skipTerrain: SKIP_TERRAIN, skipControls: SKIP_CONTROLS, skipSmooth: SKIP_SMOOTH };
 }
 
 // ── [B] ensure-assets 自检 ──────────────────────────────────────────────────
@@ -2200,6 +2279,1059 @@ async function terrainPhase(server) {
   }
 }
 
+// ── [I] 统一相机手势 / 笔刷指示圈 ──────────────────────────────────────────
+const CAMERA_EXPR = `(() => {
+  const d = window.__designer;
+  const cam = d.camera;
+  const cc = d.cameraControls;
+  const target = cc.controls.target;
+  const mouseButtons = cc.controls.mouseButtons;
+  return {
+    camera: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+    target: { x: target.x, y: target.y, z: target.z },
+    distance: cam.position.distanceTo(target),
+    enabled: cc.enabled,
+    controlsEnabled: cc.controls.enabled,
+    damping: cc.controls.enableDamping,
+    mouseButtons: mouseButtons ? { LEFT: mouseButtons.LEFT, MIDDLE: mouseButtons.MIDDLE, RIGHT: mouseButtons.RIGHT } : null,
+    keys: [...(cc.keys || [])],
+    modifiers: cc.modifiers ? { ...cc.modifiers } : null,
+  };
+})()`;
+
+const RESET_CAMERA_EXPR = `(() => {
+  const d = window.__designer;
+  const cc = d.cameraControls;
+  d.camera.position.set(3400, 4200, 5600);
+  cc.controls.target.set(0, 100, 0);
+  cc.controls.update();
+  return true;
+})()`;
+
+const INDICATOR_EXPR = `(() => {
+  const d = window.__designer;
+  const te = d && d.terrainEditor;
+  const ind = te && te.indicator;
+  const mesh = ind && ind.mesh;
+  if (!mesh) return { ok: false, hasIndicator: Boolean(ind), hasMesh: Boolean(mesh) };
+  const attr = mesh.geometry && mesh.geometry.attributes ? mesh.geometry.attributes.position : null;
+  if (!attr) return { ok: false, reason: 'mesh 无 position 属性' };
+  const arr = attr.array;
+  const count = attr.count;
+  const hf = d.heightField;
+  const exag = d.env.uExaggeration.value;
+  const yOffset = 1.5;
+  let maxDrapeError = 0;
+  let cx = 0;
+  let cz = 0;
+  const center = ind.visible ? { x: ind.x, z: ind.z } : null;
+  let minR = Infinity;
+  let maxR = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const x = arr[i * 3];
+    const y = arr[i * 3 + 1];
+    const z = arr[i * 3 + 2];
+    const ground = hf.sampleWorld(x, z) * hf.reliefMeters * exag;
+    const err = Math.abs(y - (ground + yOffset));
+    if (err > maxDrapeError) maxDrapeError = err;
+    cx += x;
+    cz += z;
+    if (center) {
+      const r = Math.hypot(x - center.x, z - center.z);
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+    }
+  }
+  let pick = null;
+  try {
+    const p = d.cameraControls.pick(640, 420);
+    if (p) pick = { x: p.x, z: p.z };
+  } catch (err) {
+    pick = null;
+  }
+  const centroid = { x: cx / count, z: cz / count };
+  return {
+    ok: true,
+    visible: mesh.visible,
+    inScene: mesh.parent === d.scene,
+    name: mesh.name,
+    vertexCount: count,
+    center,
+    centroid,
+    pick,
+    centerDelta: pick ? Math.hypot(centroid.x - pick.x, centroid.z - pick.z) : null,
+    maxDrapeError,
+    minR: Number.isFinite(minR) ? minR : null,
+    maxR: Number.isFinite(maxR) ? maxR : null,
+    radius: te.radius,
+    indicatorVisibleFlag: ind.visible,
+  };
+})()`;
+
+const dist3 = (a, b) => Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+const dist2 = (a, b) => Math.hypot(b.x - a.x, b.z - a.z);
+const round3 = (value) => Math.round(value * 1000) / 1000;
+
+function cameraDelta(before, after) {
+  return {
+    cameraMove: round3(dist3(before.camera, after.camera)),
+    targetMove: round3(dist3(before.target, after.target)),
+    distanceChange: round3(after.distance - before.distance),
+    beforeDistance: round3(before.distance),
+    afterDistance: round3(after.distance),
+    cameraBefore: before.camera,
+    cameraAfter: after.camera,
+    targetBefore: before.target,
+    targetAfter: after.target,
+  };
+}
+
+async function resetCamera(page) {
+  await page.eval(RESET_CAMERA_EXPR);
+  await sleep(300);
+}
+
+async function dispatchKeyEvent(page, type, def) {
+  await page.eval(`window.dispatchEvent(new KeyboardEvent(${JSON.stringify(type)}, ${JSON.stringify(def)}))`);
+}
+
+async function holdKey(page, downDef, upDef, ms) {
+  await dispatchKeyEvent(page, 'keydown', downDef);
+  await sleep(ms);
+  await dispatchKeyEvent(page, 'keyup', upDef);
+  await sleep(300);
+}
+
+/** 按住 Shift/Ctrl 的同时按住 W 若干毫秒（速度修饰键测试用） */
+async function holdWWithModifier(page, modifier, ms = 650) {
+  const modDown =
+    modifier === 'shift'
+      ? { code: 'ShiftLeft', key: 'Shift', shiftKey: true, bubbles: true }
+      : { code: 'ControlLeft', key: 'Control', ctrlKey: true, bubbles: true };
+  const modUp =
+    modifier === 'shift'
+      ? { code: 'ShiftLeft', key: 'Shift', shiftKey: false, bubbles: true }
+      : { code: 'ControlLeft', key: 'Control', ctrlKey: false, bubbles: true };
+  const wDown = { code: 'KeyW', key: 'w', shiftKey: modifier === 'shift', ctrlKey: modifier === 'ctrl', bubbles: true };
+  await dispatchKeyEvent(page, 'keydown', modDown);
+  await sleep(80);
+  await dispatchKeyEvent(page, 'keydown', wDown);
+  await sleep(ms);
+  await dispatchKeyEvent(page, 'keyup', wDown);
+  await dispatchKeyEvent(page, 'keyup', modUp);
+  await sleep(300);
+}
+
+/** 重置相机后按住 W（可带 Shift/Ctrl 修饰键）约 ms 毫秒，返回水平位移 / 高度变化 */
+async function measureForwardHold(page, modifier, ms = 650) {
+  await resetCamera(page);
+  const before = await page.eval(CAMERA_EXPR);
+  if (modifier) await holdWWithModifier(page, modifier, ms);
+  else await holdKey(page, { code: 'KeyW', key: 'w', bubbles: true }, { code: 'KeyW', key: 'w', bubbles: true }, ms);
+  const after = await page.eval(CAMERA_EXPR);
+  return {
+    before,
+    after,
+    horizontal: Math.hypot(after.camera.x - before.camera.x, after.camera.z - before.camera.z),
+    deltaY: Math.abs(after.camera.y - before.camera.y),
+    targetMove: dist3(before.target, after.target),
+  };
+}
+
+async function mouseDrag(page, { button, buttons, fromX, fromY, moves, settleMs = 350, moveSleepMs = 25 }) {
+  await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: fromX, y: fromY, buttons: 0 });
+  await sleep(80);
+  await page.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: fromX, y: fromY, button, buttons, clickCount: 1 });
+  let x = fromX;
+  let y = fromY;
+  for (const [dx, dy] of moves) {
+    x += dx;
+    y += dy;
+    await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button, buttons, clickCount: 1 });
+    await sleep(moveSleepMs);
+  }
+  await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, buttons: 0, clickCount: 1 });
+  await sleep(settleMs);
+}
+
+async function mouseWheel(page, { x, y, deltaY }) {
+  await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: 0, deltaY });
+  await sleep(400);
+}
+
+async function controlsPhase(server) {
+  log('\n=== [I] 统一相机手势 / 笔刷指示圈 ===');
+  const browser = await ensureBrowser();
+  if (!browser) {
+    rec('相机手势：headless Chrome 可用', false, { reason: '未找到 Chrome / Edge' });
+    return;
+  }
+  const base = `http://127.0.0.1:${server.port}/`;
+  const page = await openPage(browser, 'controls');
+  const moveSteps = (count, dx, dy) => Array.from({ length: count }, () => [dx, dy]);
+  try {
+    await page.goto(base);
+    const boot = await page.waitBoot(240000);
+    rec('相机手势：页面启动且加载完成', boot.ok, boot.details);
+    if (!boot.ok) return;
+
+    // 关闭阻尼：headless 帧率低，OrbitControls 平移惯性会泄漏到下一个手势；结束恢复 true
+    await page.eval(`(() => { const cc = window.__designer.cameraControls; cc.controls.enableDamping = false; return cc.controls.enableDamping; })()`);
+    await sleep(250);
+    const initial = await page.eval(CAMERA_EXPR);
+    rec('相机手势：测试期关闭 OrbitControls 阻尼（保证断言确定性，结束后恢复）', initial.damping === false, {
+      damping: initial.damping,
+      note: 'headless SwiftShader 帧率低，enableDamping=true 时平移惯性会泄漏到下一个手势',
+    });
+
+    // ── OrbitControls 鼠标映射 ──
+    const mouseButtons = initial.mouseButtons;
+    rec(
+      'OrbitControls 鼠标映射：LEFT=平移(PAN=2) / MIDDLE=旋转(ROTATE=0) / RIGHT=null（自定义）',
+      Boolean(mouseButtons) && mouseButtons.LEFT === 2 && mouseButtons.MIDDLE === 0 && mouseButtons.RIGHT === null,
+      { mouseButtons },
+    );
+
+    // ── 左键拖动 = 平移 ──
+    await resetCamera(page);
+    let before = await page.eval(CAMERA_EXPR);
+    await mouseDrag(page, { button: 'left', buttons: 1, fromX: 620, fromY: 400, moves: moveSteps(12, 10, 4) });
+    let after = await page.eval(CAMERA_EXPR);
+    let delta = cameraDelta(before, after);
+    rec('左键拖动 = 平移（相机+观察点同时移动，二者距离保持）', delta.cameraMove > 5 && delta.targetMove > 5 && Math.abs(delta.distanceChange) < 1, delta);
+    await page.screenshot(SHOT_CAMERA).catch(() => null);
+
+    // ── Shift + 左键拖动仍是平移（修饰键不再切换成旋转；Shift 现在是键盘速度修饰键）──
+    await resetCamera(page);
+    await dispatchKeyEvent(page, 'keydown', { code: 'ShiftLeft', key: 'Shift', shiftKey: true, bubbles: true });
+    await sleep(80);
+    before = await page.eval(CAMERA_EXPR);
+    await mouseDrag(page, { button: 'left', buttons: 1, fromX: 620, fromY: 400, moves: moveSteps(4, 8, 3), settleMs: 60 });
+    await dispatchKeyEvent(page, 'keyup', { code: 'ShiftLeft', key: 'Shift', shiftKey: false, bubbles: true });
+    await sleep(250);
+    after = await page.eval(CAMERA_EXPR);
+    delta = cameraDelta(before, after);
+    rec(
+      '按住 Shift 时左键拖动仍是平移（相机与观察点等距移动 ±3m / 距离保持，未变成旋转）',
+      delta.cameraMove > 5 &&
+        delta.targetMove > 5 &&
+        Math.abs(delta.cameraMove - delta.targetMove) < 3 &&
+        Math.abs(delta.distanceChange) < 1,
+      { ...delta, note: 'Shift 现在是键盘速度修饰键（3.2×），不再改变相机高度' },
+    );
+
+    // ── 中键拖动 = 旋转 ──
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await mouseDrag(page, { button: 'middle', buttons: 4, fromX: 620, fromY: 400, moves: moveSteps(12, 10, 3) });
+    after = await page.eval(CAMERA_EXPR);
+    delta = cameraDelta(before, after);
+    rec('中键拖动 = 绕观察点旋转（相机移动、观察点不动、距离保持）', delta.cameraMove > 5 && delta.targetMove < 2 && Math.abs(delta.distanceChange) < 1, delta);
+
+    // ── 右键横向 = 旋转 ──
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await mouseDrag(page, { button: 'right', buttons: 2, fromX: 620, fromY: 400, moves: moveSteps(12, 10, 0) });
+    after = await page.eval(CAMERA_EXPR);
+    delta = cameraDelta(before, after);
+    rec('右键横向拖动 = 绕观察点旋转（相机移动、观察点不动、距离保持）', delta.cameraMove > 5 && delta.targetMove < 2 && Math.abs(delta.distanceChange) < 1, delta);
+
+    // ── 右键纵向向上拖动 = 拉近 ──
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await mouseDrag(page, { button: 'right', buttons: 2, fromX: 640, fromY: 500, moves: moveSteps(12, 0, -8) });
+    after = await page.eval(CAMERA_EXPR);
+    delta = cameraDelta(before, after);
+    rec('右键纵向向上拖动 = 拉近（相机-观察点距离减小）', delta.distanceChange < -5, delta);
+
+    // ── 滚轮：上滚拉近、下滚拉远 ──
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await mouseWheel(page, { x: 640, y: 420, deltaY: -240 });
+    after = await page.eval(CAMERA_EXPR);
+    delta = cameraDelta(before, after);
+    rec('滚轮上滚 = 拉近（距离减小）', delta.distanceChange < -5, delta);
+
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await mouseWheel(page, { x: 640, y: 420, deltaY: 360 });
+    after = await page.eval(CAMERA_EXPR);
+    delta = cameraDelta(before, after);
+    rec('滚轮下滚 = 拉远（距离增大）', delta.distanceChange > 5, delta);
+
+    // ── 键盘垂直控制：E 抬高 / Q 降低 ──
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await holdKey(page, { code: 'KeyE', key: 'e', bubbles: true }, { code: 'KeyE', key: 'e', bubbles: true }, 700);
+    after = await page.eval(CAMERA_EXPR);
+    const eRaise = after.camera.y - before.camera.y;
+    rec('E 键 = 抬高视角（camera.y 增大 > 10 m）', eRaise > 10, {
+      beforeY: round3(before.camera.y),
+      afterY: round3(after.camera.y),
+      deltaY: round3(eRaise),
+    });
+
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    await holdKey(page, { code: 'KeyQ', key: 'q', bubbles: true }, { code: 'KeyQ', key: 'q', bubbles: true }, 700);
+    after = await page.eval(CAMERA_EXPR);
+    const qLower = after.camera.y - before.camera.y;
+    rec('Q 键 = 降低视角（camera.y 减小 > 10 m）', qLower < -10, {
+      beforeY: round3(before.camera.y),
+      afterY: round3(after.camera.y),
+      deltaY: round3(qLower),
+    });
+
+    // ── W 水平移动（方向一致）──
+    await resetCamera(page);
+    before = await page.eval(CAMERA_EXPR);
+    const forwardBefore = { x: before.target.x - before.camera.x, z: before.target.z - before.camera.z };
+    await holdKey(page, { code: 'KeyW', key: 'w', bubbles: true }, { code: 'KeyW', key: 'w', bubbles: true }, 700);
+    after = await page.eval(CAMERA_EXPR);
+    const displacement = { x: after.camera.x - before.camera.x, z: after.camera.z - before.camera.z };
+    const horizontalMove = Math.hypot(displacement.x, displacement.z);
+    const alignment =
+      horizontalMove > 0
+        ? (displacement.x * forwardBefore.x + displacement.z * forwardBefore.z) /
+          (horizontalMove * Math.hypot(forwardBefore.x, forwardBefore.z))
+        : 0;
+    const wDelta = cameraDelta(before, after);
+    rec('W 键 = 相机与观察点一起水平前移（x/z 位移 > 5m，方向与视线一致）', horizontalMove > 5 && wDelta.targetMove > 5 && alignment > 0.5, {
+      horizontalMove: round3(horizontalMove),
+      alignment: round3(alignment),
+      ...wDelta,
+    });
+
+    // ── 修饰键状态机：Shift/Ctrl keydown/keyup → cameraControls.modifiers ──
+    await dispatchKeyEvent(page, 'keydown', { code: 'ShiftLeft', key: 'Shift', shiftKey: true, bubbles: true });
+    await sleep(180);
+    const modShift = await page.eval(`(() => ({ ...window.__designer.cameraControls.modifiers }))()`);
+    await dispatchKeyEvent(page, 'keyup', { code: 'ShiftLeft', key: 'Shift', shiftKey: false, bubbles: true });
+    await sleep(180);
+    const modAfterShift = await page.eval(`(() => ({ ...window.__designer.cameraControls.modifiers }))()`);
+    await dispatchKeyEvent(page, 'keydown', { code: 'ControlLeft', key: 'Control', ctrlKey: true, bubbles: true });
+    await sleep(180);
+    const modCtrl = await page.eval(`(() => ({ ...window.__designer.cameraControls.modifiers }))()`);
+    await dispatchKeyEvent(page, 'keyup', { code: 'ControlLeft', key: 'Control', ctrlKey: false, bubbles: true });
+    await sleep(180);
+    const modAfterCtrl = await page.eval(`(() => ({ ...window.__designer.cameraControls.modifiers }))()`);
+    rec(
+      '修饰键状态：Shift/Ctrl keydown/keyup 正确反映到 cameraControls.modifiers（不再是升降键）',
+      modShift.shift === true &&
+        modShift.ctrl === false &&
+        modAfterShift.shift === false &&
+        modCtrl.ctrl === true &&
+        modCtrl.shift === false &&
+        modAfterCtrl.ctrl === false,
+      { shiftDown: modShift, afterShiftUp: modAfterShift, ctrlDown: modCtrl, afterCtrlUp: modAfterCtrl },
+    );
+
+    // ── 速度修饰键：Shift 加速 3.2× / Ctrl 缓动 0.25×（相同按键时长对比 W 基线）──
+    const speedBase = await measureForwardHold(page, null, 650);
+    const speedShift = await measureForwardHold(page, 'shift', 650);
+    const speedCtrl = await measureForwardHold(page, 'ctrl', 650);
+    const shiftRatio = speedBase.horizontal > 0 ? speedShift.horizontal / speedBase.horizontal : 0;
+    const ctrlRatio = speedBase.horizontal > 0 ? speedCtrl.horizontal / speedBase.horizontal : 0;
+    const speedDetail = {
+      baseHorizontal: round3(speedBase.horizontal),
+      shiftHorizontal: round3(speedShift.horizontal),
+      ctrlHorizontal: round3(speedCtrl.horizontal),
+      shiftRatio: round3(shiftRatio),
+      ctrlRatio: round3(ctrlRatio),
+      baseDeltaY: round3(speedBase.deltaY),
+      shiftDeltaY: round3(speedShift.deltaY),
+      ctrlDeltaY: round3(speedCtrl.deltaY),
+      bounds: { shiftMin: 1.8, ctrlMax: 0.6 },
+    };
+    rec('Shift = 加速（Shift+W 位移 > 1.8× W 基线，且不改变相机高度）', shiftRatio > 1.8 && speedShift.deltaY < 5, speedDetail);
+    rec('Ctrl = 缓动（Ctrl+W 位移 < 0.6× W 基线，且不改变相机高度）', ctrlRatio < 0.6 && speedCtrl.deltaY < 5, speedDetail);
+
+    // ── 笔刷指示圈 ──
+    const switchTerrain = await page.eval(`(() => {
+      const button = document.querySelector('#toolbar [data-mode="terrain"]');
+      if (!button) return { ok: false };
+      button.click();
+      return { ok: true };
+    })()`);
+    await sleep(900);
+    await resetCamera(page);
+    if (!switchTerrain.ok) {
+      rec('笔刷指示圈：切到地形编辑模式', false, { reason: '找不到 [data-mode="terrain"]' });
+    } else {
+      // 悬停到画布中心
+      await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 640, y: 420, buttons: 0 });
+      await sleep(500);
+      let indicator = await page.eval(INDICATOR_EXPR);
+      rec(
+        '笔刷指示圈：terrainEditor.indicator.mesh 存在（name=brush-indicator / 256 顶点 / 在场景中）',
+        Boolean(indicator?.ok) && indicator.name === 'brush-indicator' && indicator.vertexCount === 256 && indicator.inScene === true,
+        indicator,
+      );
+      rec('笔刷指示圈：地形模式下指针悬停画布 → 可见', indicator.visible === true && indicator.indicatorVisibleFlag === true, {
+        visible: indicator.visible,
+        indicatorVisibleFlag: indicator.indicatorVisibleFlag,
+        center: indicator.center,
+      });
+      rec('笔刷指示圈：逐顶点贴地（|y - (sampleWorld*relief*exag + 1.5)| < 0.01）', Boolean(indicator?.ok) && indicator.maxDrapeError < 0.01, {
+        maxDrapeError: indicator.maxDrapeError,
+        vertexCount: indicator.vertexCount,
+      });
+      rec('笔刷指示圈：圆心跟随光标（质心与 cameraControls.pick 偏差 < 1.5m）', Boolean(indicator?.ok) && indicator.centerDelta !== null && indicator.centerDelta < 1.5, {
+        center: indicator.center,
+        pick: indicator.pick,
+        centroid: indicator.centroid,
+        centerDelta: indicator.centerDelta,
+      });
+      await page.screenshot(SHOT_INDICATOR).catch(() => null);
+
+      // 半径滑块 80 → 200
+      await page.eval(`(() => {
+        const input = document.querySelector('[data-terrain="radius"]');
+        if (!input) return false;
+        input.value = '200';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(600);
+      indicator = await page.eval(INDICATOR_EXPR);
+      const radiusOk =
+        Boolean(indicator?.ok) &&
+        Math.abs(Number(indicator.minR) - 198.6) < 0.3 &&
+        Math.abs(Number(indicator.maxR) - 201.4) < 0.3 &&
+        Math.abs(Number(indicator.radius) - 200) < 1e-6;
+      rec('笔刷指示圈：半径 80→200 联动（内/外半径 ≈198.6/201.4 m）', radiusOk, {
+        radius: indicator.radius,
+        minR: round3(Number(indicator.minR)),
+        maxR: round3(Number(indicator.maxR)),
+        expectedInner: 198.6,
+        expectedOuter: 201.4,
+      });
+      await page.eval(`(() => {
+        const input = document.querySelector('[data-terrain="radius"]');
+        if (!input) return false;
+        input.value = '80';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+      await sleep(500);
+      const indicator80 = await page.eval(INDICATOR_EXPR);
+      rec('笔刷指示圈：半径恢复 80（外半径 ≈81.4 m）', Math.abs(Number(indicator80.maxR) - 81.4) < 0.3 && Math.abs(Number(indicator80.radius) - 80) < 1e-6, {
+        radius: indicator80.radius,
+        minR: round3(Number(indicator80.minR)),
+        maxR: round3(Number(indicator80.maxR)),
+      });
+
+      // updateHover：相机移动（W 键，指针不动）后指示圈重新拾取
+      const centerBeforeMove = indicator80.center;
+      await holdKey(page, { code: 'KeyW', key: 'w', bubbles: true }, { code: 'KeyW', key: 'w', bubbles: true }, 500);
+      await sleep(800);
+      const indicatorMoved = await page.eval(INDICATOR_EXPR);
+      const movedDistance = centerBeforeMove && indicatorMoved.center ? dist2(centerBeforeMove, indicatorMoved.center) : 0;
+      rec(
+        '笔刷指示圈：相机移动（W）后 updateHover 重新拾取，指示圈仍贴在光标下地形',
+        movedDistance > 2 && indicatorMoved.visible === true && indicatorMoved.centerDelta !== null && indicatorMoved.centerDelta < 1.5,
+        {
+          centerBefore: centerBeforeMove,
+          centerAfter: indicatorMoved.center,
+          movedDistance: round3(movedDistance),
+          centerDelta: indicatorMoved.centerDelta,
+          pick: indicatorMoved.pick,
+        },
+      );
+
+      // 指针移到 UI 面板 → 隐藏
+      await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 40, y: 40, buttons: 0 });
+      await sleep(500);
+      const indicatorPanel = await page.eval(INDICATOR_EXPR);
+      rec('笔刷指示圈：指针移到 UI 面板（40,40）→ 隐藏', indicatorPanel.visible === false && indicatorPanel.indicatorVisibleFlag === false, {
+        visible: indicatorPanel.visible,
+        indicatorVisibleFlag: indicatorPanel.indicatorVisibleFlag,
+      });
+
+      // 重新悬停 → 游览模式隐藏 → 退出后恢复
+      await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 640, y: 420, buttons: 0 });
+      await sleep(500);
+      const indicatorHover = await page.eval(INDICATOR_EXPR);
+      await page.eval(`(() => { const d = window.__designer; if (d && typeof d.applyTour === 'function') d.applyTour(true); return true; })()`);
+      await sleep(800);
+      const indicatorTour = await page.eval(INDICATOR_EXPR);
+      await page.eval(`(() => { const d = window.__designer; if (d && typeof d.applyTour === 'function') d.applyTour(false); return true; })()`);
+      await sleep(600);
+      await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 640, y: 420, buttons: 0 });
+      await sleep(400);
+      const indicatorAfterTour = await page.eval(INDICATOR_EXPR);
+      rec(
+        '笔刷指示圈：游览模式隐藏，退出游览后重新悬停恢复可见',
+        indicatorHover.visible === true && indicatorTour.visible === false && indicatorAfterTour.visible === true,
+        {
+          hoverVisible: indicatorHover.visible,
+          tourVisible: indicatorTour.visible,
+          afterTourVisible: indicatorAfterTour.visible,
+        },
+      );
+
+      // 切换到模型编辑 → 隐藏
+      await page.eval(`(() => {
+        const button = document.querySelector('#toolbar [data-mode="models"]');
+        if (button) button.click();
+        return true;
+      })()`);
+      await sleep(900);
+      const indicatorModels = await page.eval(INDICATOR_EXPR);
+      rec('笔刷指示圈：切到模型编辑模式 → 隐藏', indicatorModels.visible === false, {
+        visible: indicatorModels.visible,
+        indicatorVisibleFlag: indicatorModels.indicatorVisibleFlag,
+        uiClass: await page.eval(`(() => { const ui = document.getElementById('ui'); return ui ? ui.className : null; })()`),
+      });
+
+      // ── 回归：地形编辑模式下左键拖动 = 涂抹而不是平移 ──
+      await page.eval(`(() => {
+        const button = document.querySelector('#toolbar [data-mode="terrain"]');
+        if (button) button.click();
+        return true;
+      })()`);
+      await sleep(900);
+      await resetCamera(page);
+      await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 640, y: 420, buttons: 0 });
+      await sleep(400);
+      const pickBefore = await page.eval(`(() => {
+        const p = window.__designer.cameraControls.pick(640, 420);
+        return p ? { x: p.x, z: p.z } : null;
+      })()`);
+      const paintBeforeState = await page.eval(`(() => {
+        const d = window.__designer;
+        const te = d.terrainEditor;
+        const hf = d.heightField;
+        const p = d.cameraControls.pick(640, 420);
+        const t = d.cameraControls.controls.target;
+        return {
+          sample: p ? hf.sampleWorld(p.x, p.z) : null,
+          editCount: te ? te.editCount : null,
+          camera: { x: d.camera.position.x, y: d.camera.position.y, z: d.camera.position.z },
+          target: { x: t.x, y: t.y, z: t.z },
+          distance: d.camera.position.distanceTo(t),
+          enabled: d.cameraControls.enabled,
+        };
+      })()`);
+      await mouseDrag(page, { button: 'left', buttons: 1, fromX: 640, fromY: 420, moves: moveSteps(10, 7, 3), settleMs: 900 });
+      const paintAfterState = await page.eval(`(() => {
+        const d = window.__designer;
+        const te = d.terrainEditor;
+        const hf = d.heightField;
+        const p = d.cameraControls.pick(640, 420);
+        const t = d.cameraControls.controls.target;
+        return {
+          sample: p ? hf.sampleWorld(p.x, p.z) : null,
+          pick: p ? { x: p.x, z: p.z } : null,
+          editCount: te ? te.editCount : null,
+          edited: te && te.getState ? te.getState().edited : null,
+          camera: { x: d.camera.position.x, y: d.camera.position.y, z: d.camera.position.z },
+          target: { x: t.x, y: t.y, z: t.z },
+          distance: d.camera.position.distanceTo(t),
+          enabled: d.cameraControls.enabled,
+          controlsEnabled: d.cameraControls.controls.enabled,
+          indicatorVisible: te && te.indicator && te.indicator.mesh ? te.indicator.mesh.visible : null,
+        };
+      })()`);
+      const paintDelta = cameraDelta(
+        { camera: paintBeforeState.camera, target: paintBeforeState.target, distance: paintBeforeState.distance },
+        { camera: paintAfterState.camera, target: paintAfterState.target, distance: paintAfterState.distance },
+      );
+      const sampleAtSamePoint = pickBefore && paintAfterState.pick ? paintAfterState.sample > paintBeforeState.sample + 1e-4 : false;
+      rec(
+        '回归：地形编辑模式左键拖动 = 涂抹（采样高度增加 / editCount↑ / 相机不平移）',
+        Boolean(pickBefore) &&
+          sampleAtSamePoint &&
+          Number(paintAfterState.editCount) > Number(paintBeforeState.editCount) &&
+          paintDelta.cameraMove < 2 &&
+          paintDelta.targetMove < 2 &&
+          Math.abs(paintDelta.distanceChange) < 1,
+        { pickBefore, paintBefore: { sample: paintBeforeState.sample, editCount: paintBeforeState.editCount }, paintAfter: { sample: paintAfterState.sample, editCount: paintAfterState.editCount, edited: paintAfterState.edited }, cameraDelta: paintDelta },
+      );
+      rec(
+        '回归：涂抹结束后 cameraControls.enabled 恢复 true（OrbitControls 同步启用）',
+        paintAfterState.enabled === true && paintAfterState.controlsEnabled === true,
+        { enabled: paintAfterState.enabled, controlsEnabled: paintAfterState.controlsEnabled, indicatorVisible: paintAfterState.indicatorVisible },
+      );
+
+      // 清理地形编辑（恢复原始高度 + 保存空状态，保持浏览器 profile 干净）
+      const cleanupState = await page.eval(`(async () => {
+        const d = window.__designer;
+        const te = d && d.terrainEditor;
+        if (!te) return { ok: false };
+        te.resetToOriginal();
+        if (typeof te.saveNow === 'function') await te.saveNow();
+        return { ok: true, edited: te.getState ? te.getState().edited : null, dirtyCount: te.getState ? te.getState().dirtyCount : null };
+      })()`);
+      await sleep(400);
+      await page.eval(`(() => {
+        const button = document.querySelector('#toolbar [data-mode="models"]');
+        if (button) button.click();
+        return true;
+      })()`);
+      await sleep(500);
+      log(`[cleanup] 地形编辑已恢复原始：${shortJson(cleanupState)}`);
+    }
+
+    const final = await page.eval(CAMERA_EXPR);
+    rec('相机手势页面无 JS / 着色器控制台错误', page.errors.length === 0, {
+      count: page.errors.length,
+      errors: page.errors.slice(0, 10),
+      damping: final.damping,
+      enablingRestoredLater: true,
+      consoleTail: page.consoleLines.slice(-12),
+    });
+    rec('相机手势页面无关键资源加载失败', page.netFailures.length === 0, {
+      count: page.netFailures.length,
+      failures: page.netFailures.slice(0, 10),
+    });
+  } finally {
+    try {
+      await page.eval(`(async () => {
+        const d = window.__designer;
+        if (!d) return false;
+        const te = d.terrainEditor;
+        if (te) {
+          try { te.resetToOriginal(); } catch (err) { /* ignore */ }
+          try { if (typeof te.saveNow === 'function') await te.saveNow(); } catch (err) { /* ignore */ }
+        }
+        if (d.cameraControls && d.cameraControls.controls) d.cameraControls.controls.enableDamping = true;
+        return Boolean(d.cameraControls && d.cameraControls.controls && d.cameraControls.controls.enableDamping);
+      })()`);
+      log('[cleanup] [I] 恢复 OrbitControls.enableDamping = true，并清理地形编辑');
+    } catch (err) {
+      log(`[warn] [I] finally 清理失败：${err?.message ?? err}`);
+    }
+    await page.blankAndClose();
+  }
+}
+
+// ── [J] 平滑笔刷专项（可分离盒式模糊）────────────────────────────────────────
+const SMOOTH_CAPTURE_EXPR = `(() => {
+  const d = window.__designer;
+  const hf = d.heightField;
+  let center = null;
+  try {
+    const p = d.cameraControls.pick(640, 420);
+    if (p) center = { x: p.x, z: p.z };
+  } catch (err) {
+    center = null;
+  }
+  if (!center) center = { x: 0, z: 0 };
+  const W = hf.width;
+  const H = hf.height;
+  const size = hf.sizeMeters;
+  const radiusTex = Math.max(2, Math.ceil(140 / hf.pxMeters));
+  const cx = Math.round((center.x / size + 0.5) * (W - 1));
+  const cy = Math.round((center.z / size + 0.5) * (H - 1));
+  const x0 = Math.max(0, cx - radiusTex);
+  const x1 = Math.min(W - 1, cx + radiusTex);
+  const y0 = Math.max(0, cy - radiusTex);
+  const y1 = Math.min(H - 1, cy + radiusTex);
+  const normalized = hf.ensureNormalized();
+  const indices = [];
+  const values = [];
+  for (let iy = y0; iy <= y1; iy++) {
+    for (let ix = x0; ix <= x1; ix++) {
+      const i = iy * W + ix;
+      indices.push(i);
+      values.push(normalized[i]);
+    }
+  }
+  window.__smoothTest = {
+    center,
+    cx,
+    cy,
+    radiusTex,
+    x0,
+    x1,
+    y0,
+    y1,
+    indices: Uint32Array.from(indices),
+    values: Float32Array.from(values),
+  };
+  return { ok: true, center, cx, cy, radiusTex, texels: indices.length, width: W, height: H, pxMeters: hf.pxMeters };
+})()`;
+
+const SMOOTH_HELPERS_EXPR = `(() => {
+  const d = window.__designer;
+  const hf = d.heightField;
+  const t = window.__smoothTest;
+  if (!t) return { ok: false, reason: '未捕获平滑区域基线' };
+  const metricRadiusTex = Math.max(2, Math.round(120 / hf.pxMeters));
+  const metrics = () => {
+    const normalized = hf.ensureNormalized();
+    const W = hf.width;
+    const H = hf.height;
+    const x0 = Math.max(1, t.cx - metricRadiusTex);
+    const x1 = Math.min(W - 2, t.cx + metricRadiusTex);
+    const y0 = Math.max(1, t.cy - metricRadiusTex);
+    const y1 = Math.min(H - 2, t.cy + metricRadiusTex);
+    let sum = 0;
+    let count = 0;
+    let maxStep = 0;
+    for (let iy = y0; iy <= y1; iy++) {
+      for (let ix = x0; ix <= x1; ix++) {
+        const i = iy * W + ix;
+        const avg = (normalized[i - 1] + normalized[i + 1] + normalized[i - W] + normalized[i + W]) * 0.25;
+        const dev = Math.abs(normalized[i] - avg);
+        sum += dev;
+        count++;
+        if (dev > maxStep) maxStep = dev;
+      }
+    }
+    return { rough: count ? sum / count : null, maxStep, count, radiusTex: metricRadiusTex };
+  };
+  const inject = () => {
+    const indices = t.indices;
+    const values = t.values;
+    for (let k = 0; k < indices.length; k++) {
+      const i = indices[k];
+      const frac = (Math.sin(i * 12.9898 + 78.233) * 43758.5453) % 1;
+      const unit = ((frac + 1) % 1) - 0.5;
+      const value = values[k] + unit * 0.04;
+      hf.setNormalizedAt(i, value < 0 ? 0 : value > 1 ? 1 : value);
+    }
+    hf.texture.needsUpdate = true;
+    return metrics();
+  };
+  const finite = () => {
+    const normalized = hf.ensureNormalized();
+    let bad = 0;
+    for (let k = 0; k < t.indices.length; k++) {
+      const i = t.indices[k];
+      if (!Number.isFinite(normalized[i]) || !Number.isFinite(hf.half[i])) bad++;
+    }
+    const sampleFinite = Number.isFinite(hf.sampleWorld(t.center.x, t.center.z));
+    if (!sampleFinite) bad++;
+    return { bad, sampleFinite };
+  };
+  window.__smoothHelpers = { metrics, inject, finite };
+  return { ok: true, texels: t.indices.length, metricRadiusTex, metrics: metrics() };
+})()`;
+
+const SMOOTH_HASH_EXPR = `(() => {
+  const d = window.__designer;
+  const hf = d.heightField;
+  const t = window.__smoothTest;
+  const fnv = (arr) => {
+    let hash = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < arr.length; i++) {
+      const value = arr[i];
+      hash ^= value & 0xff;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+      hash ^= (value >>> 8) & 0xff;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
+  };
+  return {
+    hash: fnv(hf.half),
+    originalHash: hf.originalHalf ? fnv(hf.originalHalf) : null,
+    sampleCenter: t ? hf.sampleWorld(t.center.x, t.center.z) : null,
+    edited: d.terrainEditor && d.terrainEditor.getState ? d.terrainEditor.getState().edited : null,
+  };
+})()`;
+
+const smoothRunExpr = (strength, iterations) => `(async () => {
+  const d = window.__designer;
+  const te = d.terrainEditor;
+  const t = window.__smoothTest;
+  const before = window.__smoothHelpers.metrics();
+  await te.paintAtWorld(t.center.x, t.center.z, { tool: 'smooth', radius: 260, strength: ${strength}, iterations: ${iterations} });
+  return { ok: true, before, after: window.__smoothHelpers.metrics(), state: te.getState(), editCount: te.editCount, finite: window.__smoothHelpers.finite() };
+})()`;
+
+const toolRunExpr = (tool, radius, strength, iterations) => `(async () => {
+  const d = window.__designer;
+  const te = d.terrainEditor;
+  const t = window.__smoothTest;
+  const hf = d.heightField;
+  const sampleBefore = hf.sampleWorld(t.center.x, t.center.z);
+  const before = window.__smoothHelpers.metrics();
+  await te.paintAtWorld(t.center.x, t.center.z, { tool: '${tool}', radius: ${radius}, strength: ${strength}, iterations: ${iterations} });
+  return { ok: true, sampleBefore, sampleAfter: hf.sampleWorld(t.center.x, t.center.z), before, after: window.__smoothHelpers.metrics(), state: te.getState(), editCount: te.editCount, finite: window.__smoothHelpers.finite() };
+})()`;
+
+const SMOOTH_DRAG_STATE_EXPR = `(() => {
+  const d = window.__designer;
+  const t = window.__smoothTest;
+  const cam = d.camera;
+  const target = d.cameraControls.controls.target;
+  return {
+    metrics: window.__smoothHelpers.metrics(),
+    editCount: d.terrainEditor.editCount,
+    tool: d.terrainEditor.tool,
+    strength: d.terrainEditor.strength,
+    camera: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+    target: { x: target.x, y: target.y, z: target.z },
+    distance: cam.position.distanceTo(target),
+    enabled: d.cameraControls.enabled,
+    controlsEnabled: d.cameraControls.controls.enabled,
+    center: { x: t.center.x, z: t.center.z },
+  };
+})()`;
+
+async function smoothPhase(server) {
+  log('\n=== [J] 平滑笔刷专项（可分离盒式模糊）===');
+  const browser = await ensureBrowser();
+  if (!browser) {
+    rec('平滑笔刷：headless Chrome 可用', false, { reason: '未找到 Chrome / Edge' });
+    return;
+  }
+  const base = `http://127.0.0.1:${server.port}/`;
+  const page = await openPage(browser, 'smooth');
+  try {
+    await page.goto(base);
+    const boot = await page.waitBoot(240000);
+    rec('平滑笔刷：页面启动且加载完成', boot.ok, boot.details);
+    if (!boot.ok) return;
+
+    const originalBaseline = await page.eval(TERRAIN_HASH_EXPR);
+    // 切到地形编辑模式（面板可见 + 引擎 active，真实拖动才能涂抹）
+    await page.eval(`(() => {
+      const button = document.querySelector('#toolbar [data-mode="terrain"]');
+      if (button) button.click();
+      return true;
+    })()`);
+    await sleep(900);
+    const capture = await page.eval(SMOOTH_CAPTURE_EXPR);
+    const helpers = await page.eval(SMOOTH_HELPERS_EXPR);
+    rec(
+      '平滑笔刷：基线捕获（区域中心取画布 pick，半径 140 m，噪声基线已存）',
+      Boolean(capture?.ok) && helpers.ok === true && Number(capture.texels) > 500,
+      { capture, metricRadiusTex: helpers.metricRadiusTex, texels: helpers.texels },
+    );
+
+    // 注入确定性 ±0.02 高频噪声
+    const noise = await page.eval(`(() => window.__smoothHelpers.inject())()`);
+    rec(
+      '平滑笔刷：注入确定性 ±0.02 高频噪声（区域粗糙度 / 最大台阶升高）',
+      noise.rough > 0.004 && noise.maxStep > 0.015,
+      { noise, thresholds: { rough: 0.004, maxStep: 0.015 } },
+    );
+
+    // 100% / 60 帧
+    const run100 = await page.eval(smoothRunExpr(1, 60));
+    rec(
+      '平滑 @100% + 60 帧：局部粗糙度降至 < 0.4×（可分离盒式模糊生效）',
+      run100.before.rough > 0 && run100.after.rough < run100.before.rough * 0.4,
+      {
+        before: run100.before,
+        after: run100.after,
+        ratio: round3(run100.after.rough / run100.before.rough),
+        editCount: run100.editCount,
+      },
+    );
+    rec(
+      '平滑 @100%：最大局部台阶显著下降（< 0.3× 且 < 0.01）',
+      run100.after.maxStep < run100.before.maxStep * 0.3 && run100.after.maxStep < 0.01,
+      {
+        beforeMaxStep: run100.before.maxStep,
+        afterMaxStep: run100.after.maxStep,
+        ratio: round3(run100.after.maxStep / Math.max(run100.before.maxStep, 1e-12)),
+      },
+    );
+    rec('平滑后数值全部 finite（区域 normalized/half 无 NaN/Inf）', run100.finite.bad === 0 && run100.finite.sampleFinite === true, run100.finite);
+
+    // 30% / 30 帧
+    await page.eval(`(() => window.__smoothHelpers.inject())()`);
+    const run30 = await page.eval(smoothRunExpr(0.3, 30));
+    rec(
+      '平滑 @30% + 30 帧：局部粗糙度降至 < 0.7×（低强度也可见）',
+      run30.before.rough > 0 && run30.after.rough < run30.before.rough * 0.7,
+      {
+        before: run30.before,
+        after: run30.after,
+        ratio: round3(run30.after.rough / run30.before.rough),
+        editCount: run30.editCount,
+      },
+    );
+
+    // UI 接线：smooth 工具按钮 + 强度 100 滑杆
+    const clickSmooth = await page.eval(`(() => {
+      const button = document.querySelector('[data-terrain-tool="smooth"]');
+      if (!button) return { ok: false };
+      button.click();
+      return { ok: true, text: button.textContent.replace(/\\s+/g, ' ').trim() };
+    })()`);
+    await sleep(350);
+    const uiSmooth = await page.eval(`(() => {
+      const d = window.__designer;
+      const te = d.terrainEditor;
+      const slider = document.querySelector('[data-terrain="strength"]');
+      if (slider) {
+        slider.value = '100';
+        slider.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      return { tool: te.tool, strength: te.strength, sliderValue: slider ? slider.value : null };
+    })()`);
+    await sleep(350);
+    const uiSmoothAfter = await page.eval(`(() => {
+      const te = window.__designer.terrainEditor;
+      return { tool: te.tool, strength: te.strength, state: te.getState() };
+    })()`);
+    rec(
+      '平滑 UI 接线：smooth 工具按钮 → tool=smooth；强度 100 滑杆 → strength=1',
+      Boolean(clickSmooth.ok) && uiSmooth.tool === 'smooth' && Math.abs(Number(uiSmoothAfter.strength) - 1) < 1e-6,
+      { clickSmooth, afterClick: uiSmooth, state: uiSmoothAfter },
+    );
+
+    // 真实左键拖动：注入噪声后用 smooth 涂抹（小范围画圈停留，让笔刷区域获得足够帧数）
+    await page.eval(`(() => window.__smoothHelpers.inject())()`);
+    await page.eval(`(() => {
+      const te = window.__designer.terrainEditor;
+      te.setTool('smooth');
+      te.setStrength(1);
+      te.setRadius(200);
+      return true;
+    })()`);
+    await sleep(250);
+    const smoothCircle = [];
+    for (let i = 0; i < 6; i++) smoothCircle.push([6, 0], [0, 6], [-6, 0], [0, -6]);
+    const dragBefore = await page.eval(SMOOTH_DRAG_STATE_EXPR);
+    await mouseDrag(page, { button: 'left', buttons: 1, fromX: 640, fromY: 420, moves: smoothCircle, settleMs: 900, moveSleepMs: 60 });
+    const dragAfter = await page.eval(SMOOTH_DRAG_STATE_EXPR);
+    const dragCameraDelta = cameraDelta(
+      { camera: dragBefore.camera, target: dragBefore.target, distance: dragBefore.distance },
+      { camera: dragAfter.camera, target: dragAfter.target, distance: dragAfter.distance },
+    );
+    rec(
+      '平滑真实左键拖动：粗糙度下降 / editCount↑ / 相机未平移',
+      dragAfter.metrics.rough < dragBefore.metrics.rough * 0.85 &&
+        Number(dragAfter.editCount) > Number(dragBefore.editCount) &&
+        dragCameraDelta.cameraMove < 2 &&
+        dragCameraDelta.targetMove < 2,
+      {
+        before: dragBefore.metrics,
+        after: dragAfter.metrics,
+        ratio: round3(dragAfter.metrics.rough / Math.max(dragBefore.metrics.rough, 1e-12)),
+        editCount: { before: dragBefore.editCount, after: dragAfter.editCount },
+        cameraDelta: dragCameraDelta,
+        tool: dragAfter.tool,
+        strength: dragAfter.strength,
+      },
+    );
+    const shotSmooth = await page.screenshot(SHOT_SMOOTH).catch(() => null);
+    const shotStats = shotSmooth ? analyzeShot(shotSmooth) : { ok: false };
+    rec(
+      '平滑后截图非空（merged-15-smooth.png）+ cameraControls.enabled 恢复',
+      dragAfter.enabled === true && dragAfter.controlsEnabled === true && shotStats.ok === true,
+      {
+        screenshot: shotSmooth,
+        png: shotStats.stats ?? shotStats.error ?? null,
+        enabled: dragAfter.enabled,
+        controlsEnabled: dragAfter.controlsEnabled,
+      },
+    );
+
+    // undo：平滑后撤销回噪声基线
+    await page.eval(`(() => window.__smoothHelpers.inject())()`);
+    const noiseHash = await page.eval(SMOOTH_HASH_EXPR);
+    await page.eval(smoothRunExpr(1, 5));
+    await page.eval(`(() => { window.__designer.terrainEditor.undo(); return true; })()`);
+    await sleep(400);
+    const undoneHash = await page.eval(SMOOTH_HASH_EXPR);
+    rec(
+      '平滑 undo：half 哈希精确回到编辑前噪声基线',
+      noiseHash.hash !== undefined && undoneHash.hash === noiseHash.hash,
+      {
+        noiseHash: noiseHash.hash,
+        undoneHash: undoneHash.hash,
+        sampleCenterNoise: noiseHash.sampleCenter,
+        sampleCenterUndone: undoneHash.sampleCenter,
+      },
+    );
+
+    // resetToOriginal：回原始基线
+    await page.eval(smoothRunExpr(1, 5));
+    const resetCall = await page.eval(`(() => {
+      const te = window.__designer.terrainEditor;
+      const ok = te.resetToOriginal();
+      return { ok, state: te.getState ? te.getState() : null };
+    })()`);
+    await sleep(400);
+    const resetHash = await page.eval(SMOOTH_HASH_EXPR);
+    rec(
+      '平滑 resetToOriginal：half 哈希回到原始基线、edited=false',
+      resetCall.ok === true && resetHash.hash === originalBaseline.halfHash && resetCall.state?.edited === false,
+      { originalHash: originalBaseline.halfHash, resetHash: resetHash.hash, resetCall },
+    );
+
+    // raise / flatten 未受影响
+    await page.eval(`(() => window.__smoothHelpers.inject())()`);
+    const raiseRun = await page.eval(toolRunExpr('raise', 140, 0.5, 10));
+    rec(
+      '其他工具 raise 未受影响：中心高度增大',
+      raiseRun.sampleAfter > raiseRun.sampleBefore + 1e-4 && Number(raiseRun.editCount) > 0,
+      { sampleBefore: raiseRun.sampleBefore, sampleAfter: raiseRun.sampleAfter, editCount: raiseRun.editCount },
+    );
+
+    await page.eval(`(() => window.__smoothHelpers.inject())()`);
+    const flattenRun = await page.eval(toolRunExpr('flatten', 140, 0.5, 20));
+    rec(
+      '其他工具 flatten 未受影响：数值 finite / editCount↑ / 中心高度基本稳定',
+      flattenRun.finite.bad === 0 &&
+        Number(flattenRun.editCount) > Number(raiseRun.editCount) &&
+        Math.abs(flattenRun.sampleAfter - flattenRun.sampleBefore) < 0.05,
+      {
+        sampleBefore: flattenRun.sampleBefore,
+        sampleAfter: flattenRun.sampleAfter,
+        editCount: flattenRun.editCount,
+        finite: flattenRun.finite,
+      },
+    );
+
+    // 收尾：恢复原始高度 + 保存空状态 + 回到模型编辑模式
+    const cleanup = await page.eval(`(async () => {
+      const d = window.__designer;
+      const te = d.terrainEditor;
+      if (!te) return { ok: false };
+      if (typeof te.setTool === 'function') te.setTool('raise');
+      if (typeof te.setRadius === 'function') te.setRadius(80);
+      if (typeof te.setStrength === 'function') te.setStrength(0.3);
+      te.resetToOriginal();
+      if (typeof te.saveNow === 'function') await te.saveNow();
+      return { ok: true, state: te.getState ? te.getState() : null };
+    })()`);
+    await sleep(400);
+    await page.eval(`(() => {
+      const button = document.querySelector('#toolbar [data-mode="models"]');
+      if (button) button.click();
+      return true;
+    })()`);
+    await sleep(400);
+    log(`[cleanup] 平滑专项已恢复原始地形：${shortJson(cleanup)}`);
+
+    rec('平滑笔刷页面无 JS / 着色器控制台错误', page.errors.length === 0, {
+      count: page.errors.length,
+      errors: page.errors.slice(0, 10),
+      consoleTail: page.consoleLines.slice(-12),
+    });
+    rec('平滑笔刷页面无关键资源加载失败', page.netFailures.length === 0, {
+      count: page.netFailures.length,
+      failures: page.netFailures.slice(0, 10),
+    });
+  } finally {
+    try {
+      await page.eval(`(async () => {
+        const d = window.__designer;
+        if (!d) return false;
+        const te = d.terrainEditor;
+        if (te) {
+          try { te.resetToOriginal(); } catch (err) { /* ignore */ }
+          try { if (typeof te.saveNow === 'function') await te.saveNow(); } catch (err) { /* ignore */ }
+        }
+        return true;
+      })()`);
+      log('[cleanup] [J] 平滑专项 finally 已恢复原始地形');
+    } catch (err) {
+      log(`[warn] [J] finally 清理失败：${err?.message ?? err}`);
+    }
+    await page.blankAndClose();
+  }
+}
+
 // ── [E] 缺失资产自动生成 ────────────────────────────────────────────────────
 function analyzeGenerationLog(lines) {
   const text = lines.join('\n');
@@ -2228,8 +3360,12 @@ async function autogenPhase() {
       renameSync(BACKUP_DIR, DATA_DIR);
       log('[setup] 发现上次中断遗留的 data.__bak，已恢复为 public/data');
     } else {
-      rec('资产自动生成前置：无残留 data.__bak 目录', false, { backup: BACKUP_DIR, data: DATA_DIR });
-      return;
+      const recovery = restoreDataAside('entries');
+      log(`[setup] 发现上次中断遗留的 data.__bak 与 public/data 并存，尝试恢复：${shortJson(recovery)}`);
+      if (!recovery.restored) {
+        rec('资产自动生成前置：无残留 data.__bak 目录', false, { backup: BACKUP_DIR, data: DATA_DIR, recovery });
+        return;
+      }
     }
   }
 
@@ -2239,15 +3375,13 @@ async function autogenPhase() {
     return;
   }
 
-  let renamed = false;
-  try {
-    renameSync(DATA_DIR, BACKUP_DIR);
-    renamed = true;
-    rec('临时移走 public/data → public/data.__bak', true, { backup: BACKUP_DIR, original });
-  } catch (err) {
-    rec('临时移走 public/data → public/data.__bak', false, { error: String(err?.message ?? err) });
+  const aside = moveDataAside();
+  if (!aside.ok) {
+    rec('临时移走 public/data → public/data.__bak（整目录 rename / 逐项回退）', false, aside);
     return;
   }
+  rec('临时移走 public/data → public/data.__bak（整目录 rename / 逐项回退）', true, { aside, original, backup: BACKUP_DIR });
+  const asideMode = aside.mode;
 
   let dev = null;
   let page = null;
@@ -2327,8 +3461,8 @@ async function autogenPhase() {
       }
     }
     if (dev) await stopServer(dev);
-    const restore = restoreDataBackup();
-    rec('恢复原始 public/data 备份（data.__bak → public/data）', restore.restored, { renamed, ...restore });
+    const restore = restoreDataAside(asideMode);
+    rec('恢复原始 public/data 备份（data.__bak → public/data）', restore.restored, { asideMode, ...restore });
     const restored = inspectDataDir(DATA_DIR);
     rec('恢复后 public/data 与备份一致（高度场 + 192 张瓦片 + terrain.json）', sameDataSummary(original, restored), {
       original,
@@ -2528,7 +3662,7 @@ function writeReports(env) {
   lines.push(`- Vite：${env.viteVersion ?? 'unknown'}`);
   lines.push(`- Chrome：${env.chromePath ?? '未找到'}`);
   lines.push(`- 端口：dev ${DEV_PORT} / preview ${PREVIEW_PORT}（未使用 5173 / 5174 / 53831）`);
-  lines.push(`- 跳过项：构建=${SKIP_BUILD}，自动生成=${SKIP_AUTOGEN}，preview=${SKIP_PREVIEW}，地形编辑=${SKIP_TERRAIN}`);
+  lines.push(`- 跳过项：构建=${SKIP_BUILD}，自动生成=${SKIP_AUTOGEN}，preview=${SKIP_PREVIEW}，地形编辑=${SKIP_TERRAIN}，相机手势=${SKIP_CONTROLS}，平滑专项=${SKIP_SMOOTH}`);
   lines.push(`- 结论：**${allPass ? 'PASS' : 'FAIL'}**（${passed}/${checks.length} 通过）`);
   lines.push('');
   lines.push('| 结果 | 检查 | 详情 |');
@@ -2540,7 +3674,7 @@ function writeReports(env) {
   lines.push('');
   lines.push('## 截图');
   lines.push('');
-  for (const file of [SHOT_MAIN, SHOT_GRAPHICS, SHOT_WATER, SHOT_TOUR, SHOT_AUTOGEN, SHOT_TERRAIN_MODE, SHOT_TERRAIN_BEFORE, SHOT_TERRAIN_REALTIME, SHOT_TERRAIN_SETTLED, SHOT_TERRAIN_PERSISTED]) {
+  for (const file of [SHOT_MAIN, SHOT_GRAPHICS, SHOT_WATER, SHOT_TOUR, SHOT_AUTOGEN, SHOT_TERRAIN_MODE, SHOT_TERRAIN_BEFORE, SHOT_TERRAIN_REALTIME, SHOT_TERRAIN_SETTLED, SHOT_TERRAIN_PERSISTED, SHOT_CAMERA, SHOT_INDICATOR, SHOT_SMOOTH]) {
     lines.push(`- ${path.relative(ROOT, file)} ${existsSync(file) ? '' : '（未生成）'}`);
   }
   lines.push('');
@@ -2557,7 +3691,7 @@ function writeReports(env) {
   writeFileSync(reportMd, `${lines.join('\n')}\n`, 'utf8');
   writeFileSync(
     reportJson,
-    JSON.stringify({ environment: env, summary: { total: checks.length, passed, failed, ok: allPass }, checks, screenshots: [SHOT_MAIN, SHOT_GRAPHICS, SHOT_WATER, SHOT_TOUR, SHOT_AUTOGEN, SHOT_TERRAIN_MODE, SHOT_TERRAIN_BEFORE, SHOT_TERRAIN_REALTIME, SHOT_TERRAIN_SETTLED, SHOT_TERRAIN_PERSISTED] }, null, 2),
+    JSON.stringify({ environment: env, summary: { total: checks.length, passed, failed, ok: allPass }, checks, screenshots: [SHOT_MAIN, SHOT_GRAPHICS, SHOT_WATER, SHOT_TOUR, SHOT_AUTOGEN, SHOT_TERRAIN_MODE, SHOT_TERRAIN_BEFORE, SHOT_TERRAIN_REALTIME, SHOT_TERRAIN_SETTLED, SHOT_TERRAIN_PERSISTED, SHOT_CAMERA, SHOT_INDICATOR, SHOT_SMOOTH] }, null, 2),
     'utf8',
   );
   writeFileSync(logFile, `${transcript.join('\n')}\n`, 'utf8');
@@ -2615,6 +3749,20 @@ async function main() {
                 await terrainPhase(dev);
               });
             }
+            if (SKIP_CONTROLS) {
+              log('\n[skip] VERIFY_SKIP_CONTROLS=1，跳过相机手势 / 笔刷指示圈验证');
+            } else {
+              await phase('相机手势 / 笔刷指示圈', async () => {
+                await controlsPhase(dev);
+              });
+            }
+            if (SKIP_SMOOTH) {
+              log('\n[skip] VERIFY_SKIP_SMOOTH=1，跳过平滑笔刷专项验证');
+            } else {
+              await phase('平滑笔刷专项', async () => {
+                await smoothPhase(dev);
+              });
+            }
           }
         } finally {
           await stopServer(dev);
@@ -2657,7 +3805,7 @@ async function main() {
     log(`报告：${path.relative(ROOT, summary.reportMd)}`);
     log(`JSON：${path.relative(ROOT, summary.reportJson)}`);
     log(`日志：${path.relative(ROOT, summary.logFile)}`);
-    log(`截图：${[SHOT_MAIN, SHOT_GRAPHICS, SHOT_WATER, SHOT_TOUR, SHOT_AUTOGEN, SHOT_TERRAIN_MODE, SHOT_TERRAIN_BEFORE, SHOT_TERRAIN_REALTIME, SHOT_TERRAIN_SETTLED, SHOT_TERRAIN_PERSISTED].map((file) => path.relative(ROOT, file)).join('  ')}`);
+    log(`截图：${[SHOT_MAIN, SHOT_GRAPHICS, SHOT_WATER, SHOT_TOUR, SHOT_AUTOGEN, SHOT_TERRAIN_MODE, SHOT_TERRAIN_BEFORE, SHOT_TERRAIN_REALTIME, SHOT_TERRAIN_SETTLED, SHOT_TERRAIN_PERSISTED, SHOT_CAMERA, SHOT_INDICATOR, SHOT_SMOOTH].map((file) => path.relative(ROOT, file)).join('  ')}`);
     log(`结果：${summary.allPass ? 'PASS' : 'FAIL'}`);
     exitCode = summary.allPass ? 0 : 1;
   }
