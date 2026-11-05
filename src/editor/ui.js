@@ -26,6 +26,13 @@ const DEFAULT_HINT =
 const WATER_HINT =
   '点「＋水源」在地形上放置水源（可连续放）· 拖动水源小球改位置 · 左侧列表选中后可改半径/目标水位/名称 · Esc 结束放置';
 
+/** 地形编辑模式的默认提示 */
+const TERRAIN_HINT =
+  '按住左键在地形上涂抹：升高 / 降低 / 平整 / 平滑 · 滚轮缩放 · 右键平移 · Ctrl+Z 撤销 · Esc 结束当前笔画';
+
+/** 地形笔刷板的兜底默认值（正常情况下直接用引擎回传的 state） */
+const TERRAIN_BRUSH_FALLBACK = { tool: 'raise', radius: 80, strength: 0.3 };
+
 /** 水体面板的兜底默认值（正常情况下直接用 water.state 里的值） */
 const WATER_SIM_FALLBACK = { speed: 1, waterAmount: 15, resolution: 768, paused: false };
 const WATER_VISUAL_FALLBACK = { shimmer: 1, ripple: 1, clarity: 0.62 };
@@ -58,8 +65,18 @@ export class Ui {
     onWaterSave,
     onWaterReset,
     onFogChange,
+    onExaggerationChange,
+    onBandsChange,
+    onContourChange,
+    onHiResBudgetChange,
     onToggleTour,
     onMode,
+    onTerrainTool,
+    onTerrainRadius,
+    onTerrainStrength,
+    onTerrainUndo,
+    onTerrainReset,
+    onTerrainExport,
   }) {
     this.editor = editor;
     this.library = library;
@@ -77,8 +94,19 @@ export class Ui {
     this.onWaterSave = onWaterSave;
     this.onWaterReset = onWaterReset;
     this.onFogChange = onFogChange;
+    this.onExaggerationChange = onExaggerationChange;
+    this.onBandsChange = onBandsChange;
+    this.onContourChange = onContourChange;
+    this.onHiResBudgetChange = onHiResBudgetChange;
     this.onToggleTour = onToggleTour;
     this.onMode = onMode;
+    // 地形编辑（笔刷 DEM 雕刻）：回调都由 main 接到 TerrainEditor 上
+    this.onTerrainTool = onTerrainTool;
+    this.onTerrainRadius = onTerrainRadius;
+    this.onTerrainStrength = onTerrainStrength;
+    this.onTerrainUndo = onTerrainUndo;
+    this.onTerrainReset = onTerrainReset;
+    this.onTerrainExport = onTerrainExport;
     this.mode = 'models';
     this._suppressWaterRender = false; // 拖滑杆时避免 water.onChange → 面板重建
 
@@ -87,8 +115,10 @@ export class Ui {
     this.inspectorPanelEl = document.getElementById('panel-inspector');
     this.waterPanelEl = document.getElementById('panel-water');
     this.waterEditorPanelEl = document.getElementById('panel-water-editor');
+    this.terrainPanelEl = document.getElementById('panel-terrain');
+    this.terrainExportPanelEl = document.getElementById('panel-terrain-export');
     this.hint = document.getElementById('hint');
-    this.stats = { fps: 0, saved: null };
+    this.stats = { fps: 0, saved: null, frameMs: 0, triangles: 0, width: 0, height: 0, pixelRatio: 1 };
 
     this._buildShell();
     this._bind();
@@ -97,12 +127,9 @@ export class Ui {
 
   // ── 骨架 ──────────────────────────────────────────────────────────────────
   _buildShell() {
-    // 顶栏：项目管理 / 模型编辑 / 水体编辑 / 图形选项
+    // 顶栏：项目管理 / 模型编辑 / 水体编辑 / 地形编辑 / 图形选项
     this.toolbar.innerHTML = `
-      <div class="brand">地形模型编辑<small>8 km 地形沙盘</small></div>
-      <!-- 返回地形查看：dev 下主项目在 5173，构建后是 Pages 上一级目录 -->
-      <a class="nav-btn" href="${import.meta.env?.DEV ? 'http://127.0.0.1:5173/' : '../'}"
-         title="返回地形查看">← 地形查看</a>
+      <div class="brand">地形沙盘<small>8 km 地形模型编辑</small></div>
       <nav class="nav">
         <div class="nav-group" data-group="project">
           <button class="nav-btn" data-menu="project">项目管理 ▾</button>
@@ -115,6 +142,7 @@ export class Ui {
         </div>
         <button class="nav-btn active" data-mode="models">模型编辑</button>
         <button class="nav-btn" data-mode="water">水体编辑</button>
+        <button class="nav-btn" data-mode="terrain" title="用笔刷雕刻高程（DEM），可导出 16-bit 灰度 PNG">地形编辑</button>
         <div class="nav-group" data-group="graphics">
           <button class="nav-btn" data-menu="graphics">图形选项 ▾</button>
           <div class="menu">
@@ -127,6 +155,27 @@ export class Ui {
               <span>薄雾强度 <b data-role="fog-value">1.0×</b></span>
               <input type="range" min="0" max="300" step="10" value="100" data-act="fog-range" />
             </label>
+            <label class="menu-field">
+              <span>垂直夸张 <b data-role="exag-value">1.8×</b></span>
+              <input type="range" min="1" max="8" step="0.1" value="1.8" data-act="exag-range" />
+            </label>
+            <label class="menu-field">
+              <span>分层数 <b data-role="bands-value">48</b></span>
+              <input type="range" min="6" max="48" step="1" value="48" data-act="bands-range" />
+            </label>
+            <label class="menu-field">
+              <span>等高线 <b data-role="contour-value">100%</b></span>
+              <input type="range" min="0" max="1" step="0.05" value="1" data-act="contour-range" />
+            </label>
+            <label class="menu-field" data-role="hires-field" hidden>
+              <span>近景高清块数</span>
+              <select data-act="hires-select">
+                <option value="3" selected>3 块 · 约 64 MB</option>
+                <option value="6">6 块 · 约 128 MB</option>
+                <option value="9">9 块 · 约 192 MB</option>
+              </select>
+            </label>
+            <div class="menu-note" data-role="gpu-name">GPU 检测中…</div>
           </div>
         </div>
         <button class="nav-btn" data-act="tour"
@@ -186,6 +235,71 @@ export class Ui {
       <div class="panel-scroll"><div id="water-panel"></div></div>
     `;
 
+    // 地形编辑模式：左 = 笔刷工具 / 半径 / 强度 / 撤销，右 = 高程信息 + 灰度导出
+    this.terrainPanelEl.innerHTML = `
+      <div class="panel-head">
+        <span>地形编辑</span>
+        <span class="count" data-role="terrain-count">未编辑</span>
+      </div>
+      <div class="panel-scroll">
+        <div class="section">
+          <div class="section-title">
+            <span>笔刷工具</span>
+            <span style="font-weight:400;color:var(--dim)">左键涂抹</span>
+          </div>
+          <div class="terrain-tools">
+            <button class="btn small primary" data-terrain-tool="raise">升高</button>
+            <button class="btn small" data-terrain-tool="lower">降低</button>
+            <button class="btn small" data-terrain-tool="flatten">平整</button>
+            <button class="btn small" data-terrain-tool="smooth">平滑</button>
+          </div>
+        </div>
+        <div class="section">
+          <div class="section-title"><span>笔刷参数</span></div>
+          <label class="field"><span>半径 <b data-role="terrain-radius-value">${TERRAIN_BRUSH_FALLBACK.radius} m</b></span>
+            <input type="range" data-terrain="radius" min="10" max="600" step="5" value="${TERRAIN_BRUSH_FALLBACK.radius}" />
+          </label>
+          <label class="field"><span>强度 <b data-role="terrain-strength-value">${Math.round(TERRAIN_BRUSH_FALLBACK.strength * 100)}%</b></span>
+            <input type="range" data-terrain="strength" min="1" max="100" step="1" value="${Math.round(TERRAIN_BRUSH_FALLBACK.strength * 100)}" />
+          </label>
+        </div>
+        <div class="section">
+          <div class="row">
+            <button class="btn small" data-act="terrain-undo" title="撤销上一笔地形修改（Ctrl+Z）">撤销（Ctrl+Z）</button>
+            <button class="btn small danger" data-act="terrain-reset" title="恢复到加载时的原始高程（可撤销）">恢复原始</button>
+          </div>
+          <div class="terrain-status" data-role="terrain-status"></div>
+          <div class="hint-line">
+            按住左键在地形上涂抹…（滚轮缩放 · 右键平移 · Esc 结束当前笔画）
+          </div>
+        </div>
+      </div>
+    `;
+
+    // 地形与导出：尺寸 / 灰度映射 / 已修改点数 + 16-bit 灰度 PNG 导出
+    this.terrainExportPanelEl.innerHTML = `
+      <div class="panel-head">
+        <span>地形与导出</span>
+        <span class="count" data-role="terrain-edited">未编辑</span>
+      </div>
+      <div class="panel-scroll">
+        <div class="section">
+          <div class="section-title"><span>高程数据</span></div>
+          <div class="kv"><span>尺寸</span><span data-role="terrain-size">--</span></div>
+          <div class="kv"><span>导出格式</span><span data-role="terrain-format">16 bit 灰度 PNG</span></div>
+          <div class="kv"><span>源灰度范围</span><span data-role="terrain-gray">--</span></div>
+          <div class="kv"><span>已修改点</span><span data-role="terrain-dirty">0</span></div>
+        </div>
+        <div class="section">
+          <button class="btn small primary" data-act="terrain-export">导出灰度图（16-bit PNG）</button>
+          <div class="hint-line">
+            导出的 PNG 与 <code>resourses/heightmap64.png</code> 同格式：命名为 heightmap64.png 放回
+            <code>resourses/</code>，再执行 <code>npm run assets</code> 即可重建 height.f16 与卫星瓦片。
+          </div>
+        </div>
+      </div>
+    `;
+
     this.libList = this.modelsPanel.querySelector('#lib-list');
     this.modelList = this.modelsPanel.querySelector('#model-list');
     this.libCount = this.modelsPanel.querySelector('#lib-count');
@@ -197,16 +311,23 @@ export class Ui {
     this.waterCount = this.waterPanelEl.querySelector('#water-count');
     this.waterBody = this.waterEditorPanelEl.querySelector('#water-panel');
     this.waterSelHint = this.waterEditorPanelEl.querySelector('#water-sel-hint');
+    this.terrainCountEl = this.terrainPanelEl.querySelector('[data-role="terrain-count"]');
+    this.terrainStatusEl = this.terrainPanelEl.querySelector('[data-role="terrain-status"]');
+    this.terrainEditedEl = this.terrainExportPanelEl.querySelector('[data-role="terrain-edited"]');
+    this.terrainExportBtn = this.terrainExportPanelEl.querySelector('[data-act="terrain-export"]');
     this.statsEl = this.toolbar.querySelector('#tb-stats');
     this.hint.textContent = DEFAULT_HINT;
   }
 
-  /** 模式切换：模型编辑 / 水体编辑（互斥，面板互不显示） */
+  /** 模式切换：模型编辑 / 水体编辑 / 地形编辑（互斥，面板互不显示） */
   setMode(mode) {
-    this.mode = mode === 'water' ? 'water' : 'models';
+    this.mode = mode === 'water' ? 'water' : mode === 'terrain' ? 'terrain' : 'models';
     const root = document.getElementById('ui');
     root?.classList.toggle('mode-models', this.mode === 'models');
     root?.classList.toggle('mode-water', this.mode === 'water');
+    root?.classList.toggle('mode-terrain', this.mode === 'terrain');
+    // #app 与 #ui 是兄弟节点，画布的十字准星靠 body 上的模式类生效（见 styles.css）
+    document.body.classList.toggle('terrain-mode', this.mode === 'terrain');
     for (const btn of this.toolbar.querySelectorAll('[data-mode]')) {
       btn.classList.toggle('active', btn.dataset.mode === this.mode);
     }
@@ -259,11 +380,44 @@ export class Ui {
       if (!event.target.closest('.nav-group')) this._closeMenus();
     });
 
-    // 图形选项里的薄雾滑杆：拖动实时生效
+    // 图形选项里的滑杆：拖动实时生效（薄雾 / 垂直夸张 / 分层数 / 等高线）
     this.toolbar.addEventListener('input', (event) => {
-      const range = event.target?.closest?.('[data-act="fog-range"]');
-      if (!range) return;
-      this.onFogChange?.(Number(range.value) / 100);
+      const range = event.target?.closest?.('[data-act]');
+      if (!range || range.tagName !== 'INPUT') return;
+      const value = Number(range.value);
+      if (range.dataset.act === 'fog-range') this.onFogChange?.(value / 100);
+      else if (range.dataset.act === 'exag-range') this.onExaggerationChange?.(value);
+      else if (range.dataset.act === 'bands-range') this.onBandsChange?.(value);
+      else if (range.dataset.act === 'contour-range') this.onContourChange?.(value);
+    });
+
+    // 图形选项里的「近景高清块数」下拉
+    this.toolbar.addEventListener('change', (event) => {
+      const select = event.target?.closest?.('[data-act="hires-select"]');
+      if (!select) return;
+      this.onHiResBudgetChange?.(Number(select.value));
+    });
+
+    // ── 地形编辑：笔刷工具按钮 + 半径 / 强度滑杆（面板结构固定，直接绑在面板上）──
+    this.terrainPanelEl.addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-terrain-tool]');
+      if (!btn) return;
+      this.onTerrainTool?.(btn.dataset.terrainTool);
+    });
+    this.terrainPanelEl.addEventListener('input', (event) => {
+      const input = event.target.closest('[data-terrain]');
+      if (!input) return;
+      const value = Number(input.value);
+      if (!Number.isFinite(value)) return;
+      if (input.dataset.terrain === 'radius') {
+        this.onTerrainRadius?.(value); // 米
+        const out = this.terrainPanelEl.querySelector('[data-role="terrain-radius-value"]');
+        if (out) out.textContent = `${Math.round(value)} m`;
+      } else if (input.dataset.terrain === 'strength') {
+        this.onTerrainStrength?.(value / 100); // 回调用 0–1
+        const out = this.terrainPanelEl.querySelector('[data-role="terrain-strength-value"]');
+        if (out) out.textContent = `${Math.round(value)}%`;
+      }
     });
 
     // 资源库 / 模型列表 / 检查器共用的点击委托
@@ -291,10 +445,17 @@ export class Ui {
   }
 
   renderStats() {
-    const { fps } = this.stats;
+    const { fps, frameMs, triangles, width, height, pixelRatio } = this.stats;
     const saved = this.stats.saved;
     const savedText = saved === null ? '未修改' : saved === -1 ? '保存失败' : `已自动保存 ${new Date(saved).toLocaleTimeString()}`;
-    this.statsEl.textContent = `${fps.toFixed(0)} fps · ${this.editor.models.length} 个实例 · ${this.library.all.length} 个资源 · ${savedText}`;
+    const perf =
+      width > 0
+        ? ` · ${(triangles / 1000).toFixed(0)}k 三角面 · ${width}×${height}@${pixelRatio.toFixed(2)}×`
+        : '';
+    const frame = frameMs > 0 ? `（${frameMs.toFixed(1)} ms）` : '';
+    this.statsEl.textContent =
+      `${fps.toFixed(0)} fps${frame}${perf} · ${this.editor.models.length} 个实例 · ` +
+      `${this.library.all.length} 个资源 · ${savedText}`;
     this.statsEl.style.color = saved === -1 ? 'var(--warn)' : '';
   }
 
@@ -752,6 +913,12 @@ export class Ui {
       case 'water-save':
         this.onWaterSave?.();
         break;
+      // 地形编辑：撤销 / 恢复原始 / 导出 16-bit 灰度 PNG
+      case 'terrain-undo':
+      case 'terrain-reset':
+      case 'terrain-export':
+        this._runAction(act, target);
+        break;
       case 'add-label': {
         if (!model) break;
         const input = this.inspectorBody.querySelector('[data-role="new-label-name"]');
@@ -901,11 +1068,22 @@ export class Ui {
     editor.scheduleSave();
   }
 
-  setFps(fps) {
-    this.stats.fps = fps;
+  /** 每 0.25s 刷新一次的性能数据（FPS / 帧时间 / 三角面 / 渲染分辨率） */
+  setPerf(perf = {}) {
+    if (Number.isFinite(perf.fps)) this.stats.fps = perf.fps;
+    if (Number.isFinite(perf.frameMs)) this.stats.frameMs = perf.frameMs;
+    if (Number.isFinite(perf.triangles)) this.stats.triangles = perf.triangles;
+    if (Number.isFinite(perf.width)) this.stats.width = perf.width;
+    if (Number.isFinite(perf.height)) this.stats.height = perf.height;
+    if (Number.isFinite(perf.pixelRatio)) this.stats.pixelRatio = perf.pixelRatio;
     this.renderStats();
     // 水体模式右下角的模拟步数 / 状态每 0.25s 跟着刷新
     if (this.mode === 'water') this.renderWaterStats();
+  }
+
+  /** 兼容旧调用：只更新 FPS */
+  setFps(fps) {
+    this.setPerf({ fps });
   }
 
   /** 更新工具栏「贴图」开关的文案/高亮（地形无瓦片时在提示里说明） */
@@ -1019,6 +1197,152 @@ export class Ui {
     if (exit) exit.hidden = !tour;
   }
 
+  // ── 地形编辑面板（笔刷 DEM 雕刻）────────────────────────────────────────────
+  /** 引擎状态回写：工具高亮 / 半径强度滑杆 / 是否已编辑 / 已修改点数 / 撤销可用性 */
+  setTerrainState(state = {}) {
+    const { tool, radius, strength, edited, editCount, dirtyCount, undoCount } = state ?? {};
+    const panel = this.terrainPanelEl;
+    if (!panel) return;
+
+    if (typeof tool === 'string' && tool) {
+      for (const btn of panel.querySelectorAll('[data-terrain-tool]')) {
+        const on = btn.dataset.terrainTool === tool;
+        btn.classList.toggle('primary', on);
+        btn.classList.toggle('active', on);
+      }
+    }
+
+    // 滑杆：拖动中的元素不回写 value（否则会抢指针），标签文字始终同步
+    const radiusValue = Number(radius);
+    const radiusInput = panel.querySelector('[data-terrain="radius"]');
+    const radiusOut = panel.querySelector('[data-role="terrain-radius-value"]');
+    if (Number.isFinite(radiusValue)) {
+      if (radiusInput && document.activeElement !== radiusInput) radiusInput.value = String(radiusValue);
+      if (radiusOut) radiusOut.textContent = `${Math.round(radiusValue)} m`;
+    }
+
+    const strengthValue = Number(strength);
+    const strengthInput = panel.querySelector('[data-terrain="strength"]');
+    const strengthOut = panel.querySelector('[data-role="terrain-strength-value"]');
+    if (Number.isFinite(strengthValue)) {
+      const percent = Math.round(strengthValue * 100);
+      if (strengthInput && document.activeElement !== strengthInput) strengthInput.value = String(percent);
+      if (strengthOut) strengthOut.textContent = `${percent}%`;
+    }
+
+    if (edited !== undefined && this.terrainEditedEl) {
+      this.terrainEditedEl.textContent = edited ? '已编辑' : '未编辑';
+    }
+
+    const dirtyEl = this.terrainExportPanelEl?.querySelector('[data-role="terrain-dirty"]');
+    const dirtyValue = Number(dirtyCount);
+    if (dirtyEl && Number.isFinite(dirtyValue)) {
+      dirtyEl.textContent = `${Math.max(0, Math.round(dirtyValue))} 个点`;
+    }
+
+    const countEl = this.terrainCountEl;
+    if (countEl && (edited !== undefined || editCount !== undefined)) {
+      const count = Number(editCount);
+      const countText = Number.isFinite(count) ? Math.max(0, Math.round(count)) : 0;
+      countEl.textContent = edited ? `${countText} 次编辑` : '未编辑';
+    }
+
+    const undoBtn = panel.querySelector('[data-act="terrain-undo"]');
+    const undoValue = Number(undoCount);
+    if (undoBtn && Number.isFinite(undoValue)) undoBtn.disabled = undoValue <= 0;
+  }
+
+  /** 导出信息：尺寸 / 源灰度范围（bitDepth 只影响「导出格式」文案） */
+  setTerrainExportInfo(info = {}) {
+    const { width, height, bitDepth, minGray, maxGray } = info ?? {};
+    const host = this.terrainExportPanelEl;
+    if (!host) return;
+
+    const sizeEl = host.querySelector('[data-role="terrain-size"]');
+    const w = Number(width);
+    const h = Number(height);
+    if (sizeEl && Number.isFinite(w) && Number.isFinite(h)) {
+      sizeEl.textContent = `${Math.round(w)}×${Math.round(h)}`;
+    }
+
+    const grayEl = host.querySelector('[data-role="terrain-gray"]');
+    const min = Number(minGray);
+    const max = Number(maxGray);
+    if (grayEl && Number.isFinite(min) && Number.isFinite(max)) grayEl.textContent = `${min}–${max}`;
+
+    const formatEl = host.querySelector('[data-role="terrain-format"]');
+    const depth = Number(bitDepth);
+    if (formatEl && Number.isFinite(depth) && depth > 0) formatEl.textContent = `${Math.round(depth)} bit 灰度 PNG`;
+  }
+
+  /** 笔刷状态行（导出进度 / 撤销提示等）；null 或空串清空 */
+  setTerrainStatus(text) {
+    if (!this.terrainStatusEl) return;
+    this.terrainStatusEl.textContent = text ? String(text) : '';
+  }
+
+  /** 导出中：禁用导出按钮并改文案，结束后恢复 */
+  setTerrainBusy(on) {
+    const busy = Boolean(on);
+    const host = this.terrainExportPanelEl;
+    if (!host) return;
+    for (const btn of host.querySelectorAll('[data-act="terrain-export"]')) {
+      btn.disabled = busy;
+      btn.textContent = busy ? '导出中…' : '导出灰度图（16-bit PNG）';
+    }
+  }
+
+  // ── 地形显示参数（垂直夸张 / 分层数 / 等高线 / 近景高清块数 / GPU 名）──────
+  _setMenuRange(act, value, text) {
+    const range = this.toolbar.querySelector(`[data-act="${act}"]`);
+    if (range && document.activeElement !== range) range.value = String(value);
+    const out = range?.closest('.menu-field')?.querySelector('span b');
+    if (out && text !== undefined) out.textContent = text;
+  }
+
+  /** 垂直夸张滑杆状态（1–8×） */
+  setExaggerationState(value) {
+    this._setMenuRange('exag-range', value, `${Number(value).toFixed(1)}×`);
+  }
+
+  /** 分层数滑杆状态（6–48） */
+  setBandsState(value) {
+    this._setMenuRange('bands-range', value, String(Math.round(value)));
+  }
+
+  /** 等高线滑杆状态（0–1 → 百分比） */
+  setContourState(value) {
+    this._setMenuRange('contour-range', value, `${Math.round(Number(value) * 100)}%`);
+  }
+
+  /** 近景高清块数：有卫星瓦片时显示；0 表示显卡不支持 2048²，退回中景档 */
+  setHasSatellite(hasSatellite) {
+    const field = this.toolbar.querySelector('[data-role="hires-field"]');
+    if (field) field.hidden = !hasSatellite;
+  }
+
+  setHiResBudgetState(value) {
+    const select = this.toolbar.querySelector('[data-act="hires-select"]');
+    if (!select) return;
+    const n = Number(value);
+    if (n === 3 || n === 6 || n === 9) {
+      select.value = String(n);
+      select.dataset.fallback = '';
+      select.title = '同时驻留的 2048² 近景瓦片上限';
+    } else {
+      select.dataset.fallback = '1';
+      select.title = '显卡不支持 2048² 纹理，已退回中景档';
+    }
+  }
+
+  /** 图形选项下方显示当前上下文实际绑定的 GPU（仅信息展示，不提供切换入口） */
+  setGpuName(name) {
+    const el = this.toolbar.querySelector('[data-role="gpu-name"]');
+    if (!el) return;
+    el.textContent = `GPU：${name}`;
+    el.title = name;
+  }
+
   /** 顶栏菜单与面板按钮共用的动作分派 */
   _runAction(act, btn) {
     if (act === 'import') this.onImportFiles?.();
@@ -1031,6 +1355,9 @@ export class Ui {
     else if (act === 'toggle-collision') this.onToggleCollision?.();
     else if (act === 'toggle-water') this.onToggleWater?.();
     else if (act === 'tour') this.onToggleTour?.();
+    else if (act === 'terrain-undo') this.onTerrainUndo?.();
+    else if (act === 'terrain-reset') this.onTerrainReset?.();
+    else if (act === 'terrain-export') this.onTerrainExport?.();
     else if (act === 'reset') {
       if (confirm('清空所有场景模型与本地工程？（资源文件夹里的 glb 不会被删除）')) this.onReset?.();
     }
@@ -1225,6 +1552,8 @@ export class Ui {
 
   /** 当前模式的默认提示文案 */
   _defaultHint() {
-    return this.mode === 'water' ? WATER_HINT : DEFAULT_HINT;
+    if (this.mode === 'water') return WATER_HINT;
+    if (this.mode === 'terrain') return TERRAIN_HINT;
+    return DEFAULT_HINT;
   }
 }

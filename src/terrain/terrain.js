@@ -148,6 +148,9 @@ export class Terrain {
       ...env,
       uTerrain: { value: lookupTexture },
       uTerrainTexel: { value: new THREE.Vector2(1 / hf.width, 1 / hf.height) },
+      // 顶点位移直接采样原始高度图：地形编辑只改这张图就能实时看到新高度
+      uHeight: { value: heightField.texture },
+      uHeightTexel: { value: new THREE.Vector2(1 / hf.width, 1 / hf.height) },
       uPalette: { value: paletteTexture },
       uReliefMeters: { value: hf.reliefMeters },
       uMinElevation: { value: hf.elevation.minMeters },

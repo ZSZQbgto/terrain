@@ -1,18 +1,20 @@
 /**
- * IndexedDB 存 glb 二进制。
+ * IndexedDB 存 glb 二进制 + 地形编辑后的高度场。
  *
  * 编辑器里的模型来自用户本地文件，刷新页面后浏览器不允许再读原路径，
  * 所以把原始 ArrayBuffer 存进 IndexedDB：工程（transform / 标签）存 localStorage，
  * 模型文件按 assetId 从这里取回。
  *
- * 两个 store：
+ * 三个 store：
  *   assets —— { id, buffer, type }        二进制本体
  *   meta   —— { id, name, size, type, createdAt }  列表用的元数据（避免为此读大 buffer）
+ *   world  —— { id, buffer, ...meta }     世界级数据（当前用于「地形编辑」后的高度场）
  */
 const DB_NAME = 'terrain-modeldesigner';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const ASSET_STORE = 'assets';
 const META_STORE = 'meta';
+const WORLD_STORE = 'world';
 
 let dbPromise = null;
 
@@ -24,6 +26,7 @@ function openDb() {
       const db = req.result;
       if (!db.objectStoreNames.contains(ASSET_STORE)) db.createObjectStore(ASSET_STORE, { keyPath: 'id' });
       if (!db.objectStoreNames.contains(META_STORE)) db.createObjectStore(META_STORE, { keyPath: 'id' });
+      if (!db.objectStoreNames.contains(WORLD_STORE)) db.createObjectStore(WORLD_STORE, { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -81,6 +84,38 @@ export async function clearAssets() {
     const tx = db.transaction([ASSET_STORE, META_STORE], 'readwrite');
     tx.objectStore(ASSET_STORE).clear();
     tx.objectStore(META_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ── 世界级数据（地形编辑后的高度场）────────────────────────────────────────
+/** 写入一条世界数据（buffer 是 ArrayBuffer，meta 里放 width/height/updatedAt 等） */
+export async function putWorld(id, { buffer, ...meta }) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(WORLD_STORE, 'readwrite');
+    tx.objectStore(WORLD_STORE).put({ id, buffer, ...meta });
+    tx.oncomplete = () => resolve(id);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+export async function getWorld(id) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(WORLD_STORE, 'readonly').objectStore(WORLD_STORE).get(id);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteWorld(id) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(WORLD_STORE, 'readwrite');
+    tx.objectStore(WORLD_STORE).delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

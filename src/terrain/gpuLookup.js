@@ -59,8 +59,78 @@ void main() {
 `;
 
 /**
+ * 可复用的查询纹理更新器：地形编辑时高度纹理会频繁变化，
+ * 每次重建都 new 一张 1081² RGBA16F render target 会反复分配显存并产生 GC 抖动，
+ * 这里复用一个 target / material / quad，只重新渲染内容。
+ *
+ *   const updater = createLookupUpdater(renderer, opts);
+ *   updater.update(heightField.texture);   // 首次 + 每次高度变化后调用
+ *   terrainTexture = updater.texture;      // 内容原地更新，引用不变
+ */
+export function createLookupUpdater(renderer, opts) {
+  const { width, height, reliefMeters, pxMeters, aoStrength = 1, exagRef = 4 } = opts;
+
+  const target = new THREE.WebGLRenderTarget(width, height, {
+    type: THREE.HalfFloatType,
+    format: THREE.RGBAFormat,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    wrapS: THREE.ClampToEdgeWrapping,
+    wrapT: THREE.ClampToEdgeWrapping,
+    depthBuffer: false,
+    stencilBuffer: false,
+    generateMipmaps: false,
+  });
+
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      uHeight: { value: null },
+      uTexel: { value: new THREE.Vector2(1 / width, 1 / height) },
+      uGradScale: { value: reliefMeters / (2 * pxMeters) },
+      uHeightWorld: { value: reliefMeters * exagRef },
+      uPxMeters: { value: pxMeters },
+      uAoStrength: { value: aoStrength },
+    },
+    vertexShader: VERT,
+    fragmentShader: FRAG,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  const geometry = new THREE.PlaneGeometry(2, 2);
+  const quad = new THREE.Mesh(geometry, material);
+  quad.frustumCulled = false;
+  const scene = new THREE.Scene();
+  scene.add(quad);
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+  const texture = target.texture;
+  texture.flipY = false;
+  texture.generateMipmaps = false;
+
+  const update = (heightTexture) => {
+    material.uniforms.uHeight.value = heightTexture;
+    const prevTarget = renderer.getRenderTarget();
+    const prevClear = renderer.getClearAlpha();
+    renderer.setRenderTarget(target);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(prevTarget);
+    renderer.setClearAlpha(prevClear);
+  };
+
+  const dispose = () => {
+    target.dispose();
+    material.dispose();
+    geometry.dispose();
+  };
+
+  return { texture, update, dispose, target };
+}
+
+/**
+ * 一次性构建查询纹理（首次创建）。需要反复重建时用 createLookupUpdater 复用资源。
  * @param {import('three').WebGLRenderer} renderer
- * @param {import('three').Texture} heightTexture R16F 高度图
+ * @param {THREE.Texture} heightTexture R16F 高度图
  * @param {{width:number,height:number,reliefMeters:number,pxMeters:number,aoStrength?:number,exagRef?:number}} opts
  * @returns {THREE.Texture} RGBA16F 查询纹理
  */

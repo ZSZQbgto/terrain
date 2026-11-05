@@ -7,4 +7,7 @@ dist/
 # 离线管线的输出（可由 npm run assets 重新生成）
 public/data/
 
+# 端到端验证产物（tests/verify-merged.mjs 生成：截图 / 报告 / 日志）
+tests/out/
+
 /.idea/

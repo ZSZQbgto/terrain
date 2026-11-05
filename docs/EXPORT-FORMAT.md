@@ -34,6 +34,9 @@
 | `models` | array | 场景里的模型实例，顺序无意义（渲染按 `id` 匹配） |
 | `embeddedAssets` | object | **仅内嵌模式**。键 = `asset.url`（文件夹资源）或 `asset.id`（本地暂存）；`water` 与它无关 |
 
+> **地形高度编辑不属于本工程文件**（见第 6 节）：它单独保存在浏览器 IndexedDB 的世界状态里，
+> 导入 / 导出工程都不会改变地形形状；要持久化或分享地形，请用「地形与导出」导出 16-bit 灰度 PNG。
+
 ## 3. 模型实例 `models[]`
 
 ```json
@@ -161,6 +164,8 @@ THREE.Scene
 - **水体渲染**：`FluidWater`（`src/water/fluidWater.js`）读取同一份 `heightField.texture` 做
   GPU 浅水模拟；水面网格按模拟水位位移，雾 / 天空 / 太阳 uniform 与地形共用。工程里只存
   水源与参数，**不存当前水位**
+- **地形高度编辑**：地形顶点着色器直接采样 `heightField.texture`（R16F 高度图），笔刷修改后
+  下一帧几何即更新（AO / 梯度查询纹理延迟重建）。地形编辑器独立于模型工程，见第 6 节
 - **标签渲染**：每个标签一个 `CSS2DObject`，挂在目标节点（或 `content` 根）上，
   由 `CSS2DRenderer` 叠加在 canvas 之上
 
@@ -169,8 +174,9 @@ THREE.Scene
 | 存储 | 内容 | 键 |
 | --- | --- | --- |
 | `localStorage` | 引用模式工程 JSON（不含 glb；含 `water`） | `modeldesigner.project.v1` |
-| `localStorage` | 视图设置（贴图 / 碰撞 / 水体开关 / 标签显示 / 薄雾强度 / 界面模式，不属于工程） | `modeldesigner.settings.v1` |
+| `localStorage` | 视图设置（贴图 / 碰撞 / 水体开关 / 标签显示 / 薄雾强度 / 垂直夸张 / 分层数 / 等高线 / 近景高清块数 / 界面模式，不属于工程） | `modeldesigner.settings.v1` |
 | IndexedDB | glb 字节（`source: "local"` 的资源） | 库 `terrain-modeldesigner` / store `assets`、`meta` |
+| IndexedDB | 地形高度编辑后的归一化高度场（**世界状态，不属于本工程**） | 库 `terrain-modeldesigner` / store `world` / 键 `terrain-edit-v1` |
 
 全局贴图开关（地形卫星瓦片 / 模型自带 `map`）属于视图状态，不写进工程 JSON，
 所以换一份工程时不会被它影响；它只影响渲染，不改变任何 transform 或标签数据。
@@ -179,6 +185,12 @@ THREE.Scene
 读 `localStorage` → 逐个按 `asset` 取字节 → `GLTFLoader.parseAsync` → 先应用 `partTransforms`
 再应用 `transform`，最后把 `water` 交给 `FluidWater.load()`（按保存的水源与参数重新开始模拟）。
 资源取不到的模型会被跳过，并在界面提示「N 个资源缺失」。
+
+地形高度编辑另走一套：一次笔画结束后约 900 ms 写入 `world` store，刷新页面时在构建 GPU
+查询纹理之前恢复，所以地形与光照都是编辑后的状态；它**不写入** `modeldesigner.project.v1`，
+因此导入 / 清空工程都不会改变地形。要在机器之间保留地形形状，用「地形与导出 →
+导出灰度图（16-bit PNG）」生成与 `resourses/heightmap64.png` 同格式的文件，放回源图目录后
+重新 `npm run assets` 即可重建 `height.f16` 与卫星瓦片。
 
 ## 7. 导入工程的容错
 
@@ -192,8 +204,10 @@ THREE.Scene
 ## 8. 尚未包含（避免误用）
 
 - **不导出 glb**：编辑结果（缩放/旋转/部件微调）只存在于工程 JSON，没有把变换烘回模型文件
-- **不导出图片/缩略图**
+- **不导出图片/缩略图**：工程 JSON 不含截图 / 缩略图；地形编辑的 DEM 灰度 PNG 是独立导出，不属于工程
 - **不保存当前水位/流量**：`water` 只存水源与模拟参数，导入后从干地重新模拟
+- **不包含地形高度编辑**：DEM 笔刷结果只存在浏览器 IndexedDB（世界状态），不在工程 JSON 里；
+  分享地形形状要导出 16-bit 灰度 PNG 并用资产管线重建（不是 glTF / OBJ 网格）
 - **标签不驱动任何逻辑**：它只是名称 + 类型 + 挂载点，不做动画、条件或业务联动
 - **`.gltf`（文本）** 若引用外部 `.bin` / 贴图，单独导入会缺资源；请优先用单文件 `.glb`
 

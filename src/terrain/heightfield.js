@@ -27,6 +27,28 @@ export function halfToFloat(h) {
 const HALF_TO_FLOAT = new Float32Array(65536);
 for (let i = 0; i < 65536; i++) HALF_TO_FLOAT[i] = halfToFloat(i);
 
+const _f32 = new Float32Array(1);
+const _i32 = new Int32Array(_f32.buffer);
+
+/** float32 → float16 位模式（写入 R16F 纹理 / half 数组；与 scripts/prepare-assets.mjs 的 toHalf 同算法） */
+export function floatToHalf(value) {
+  _f32[0] = value;
+  const x = _i32[0];
+  let bits = (x >> 16) & 0x8000;
+  let m = (x >> 12) & 0x07ff;
+  const e = (x >> 23) & 0xff;
+  if (e < 103) return bits;
+  if (e > 142) return bits | 0x7c00;
+  if (e < 113) {
+    m |= 0x0800;
+    bits |= (m >> (114 - e)) + ((m >> (113 - e)) & 1);
+    return bits;
+  }
+  bits |= ((e - 112) << 10) | (m >> 1);
+  bits += m & 1;
+  return bits;
+}
+
 /** Catmull-Rom 三次权重（对应 -1 / 0 / 1 / 2 四个样本） */
 function crWeights(t, out) {
   const t2 = t * t;
@@ -50,6 +72,61 @@ export class HeightField {
     this.pxMeters = this.sizeMeters / (this.width - 1);
     this._wx = new Float64Array(4);
     this._wy = new Float64Array(4);
+
+    // ── 地形编辑（sculpt）需要的状态 ────────────────────────────────────────
+    // 源灰度信息：导出 16 bit 灰度 PNG 时把归一化高度映射回源灰度值
+    this.sourceRange = meta.sourceRange ?? null;
+    this.bitDepth = Number.isFinite(meta.sourceRange?.bitDepth) ? meta.sourceRange.bitDepth : 16;
+    this.originalHalf = half.slice(); // 原始高度（复位用；2.2 MB）
+    this._normalized = null; // 归一化 Float32Array，编辑 / 导出时惰性构建
+  }
+
+  /** 归一化高度数组（0..1）Float32Array；编辑与导出共用，首次调用时从 half 转换一次 */
+  ensureNormalized() {
+    if (!this._normalized) {
+      const out = new Float32Array(this.half.length);
+      for (let i = 0; i < out.length; i++) out[i] = HALF_TO_FLOAT[this.half[i]];
+      this._normalized = out;
+    }
+    return this._normalized;
+  }
+
+  /** 写单个像素高度（归一化 0..1）：同时更新 CPU 数组、half 纹理位与 GPU 纹理 */
+  setNormalizedAt(index, value) {
+    const v = value < 0 ? 0 : value > 1 ? 1 : value;
+    const normalized = this.ensureNormalized();
+    normalized[index] = v;
+    this.half[index] = floatToHalf(v);
+    this.texture.needsUpdate = true;
+  }
+
+  /** 整幅替换归一化高度（撤销 / 恢复保存的地形）；长度按调用方保证 */
+  applyNormalizedArray(array) {
+    const normalized = this.ensureNormalized();
+    const len = Math.min(normalized.length, array.length);
+    for (let i = 0; i < len; i++) {
+      const v = array[i];
+      normalized[i] = v;
+      this.half[i] = floatToHalf(v);
+    }
+    this.texture.needsUpdate = true;
+  }
+
+  /** 恢复出厂高度（逐字节还原原始 half 位模式） */
+  resetToOriginal() {
+    if (!this.originalHalf) return false;
+    this.half.set(this.originalHalf);
+    this._normalized = null;
+    this.texture.needsUpdate = true;
+    return true;
+  }
+
+  /** 与原始高度逐像素比较，返回被修改的像素数（同时返回哪些像素被改，供编辑状态显示） */
+  countEditedPixels() {
+    if (!this.originalHalf) return 0;
+    let count = 0;
+    for (let i = 0; i < this.half.length; i++) if (this.half[i] !== this.originalHalf[i]) count++;
+    return count;
   }
 
   /** 双三次采样，u/v ∈ [0,1]（v=0 为影像首行＝北侧）。仅用于拾取/求交等轻量查询。 */

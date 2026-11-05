@@ -1,8 +1,9 @@
 # CI：push / PR 做构建校验；push 到 master 时把 dist 发布到 GitHub Pages。
 #
-# 数据来源：public/data 在 .gitignore 里（二进制产物），由 resourses/ 里的源图
-# 在构建阶段用 `npm run assets` 现场生成。卫星源图不在仓库，管线会自动跳过卫星瓦片，
-# 因此站点只展示高程分层地形（页面运行时探测瓦片，缺了就降级，不会报错）。
+# 单一前端（仓库根目录）：
+#   数据来源：public/data 在 .gitignore 里（二进制产物），由 resourses/ 里已跟踪的源图
+#   在构建阶段用 `npm run assets` 现场生成（高度场 + 192 张卫星瓦片）。
+#   本 workflow 显式校验资产与产物，缺一个即失败，避免发布一个没有地形的站点。
 #
 # 首次使用需要在仓库 Settings → Pages → Build and deployment → Source
 # 选择 "GitHub Actions"。
@@ -38,10 +39,8 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          # 两个前端各有一份 lockfile
-          cache-dependency-path: |
-            package-lock.json
-            modeldesigner/package-lock.json
+          # 单一前端：只有根目录一份 lockfile
+          cache-dependency-path: package-lock.json
 
       - name: 安装依赖
         run: npm ci
@@ -50,46 +49,26 @@ jobs:
         run: npm run assets
 
       - name: 校验地形资产
-        # assets 缺源图时是"跳过"而不是失败，这里显式把关，
-        # 避免把没有地形数据的站点发出去
+        # assets 缺源图时是"跳过"而不是失败，这里显式把关：
+        # 高度场 + 元数据 + 卫星瓦片 8×8×3 = 192 张，缺一个就不发布
         run: |
           test -f public/data/height.f16
           test -f public/data/terrain.json
+          test "$(find public/data/sat -name '*.jpg' | wc -l)" -eq 192
 
-      - name: 构建主项目
+      - name: 构建前端
         run: npm run build
 
-      - name: 校验主项目产物
+      - name: 校验构建产物
+        # postbuild（node scripts/ensure-assets.mjs --dist）会自动补齐 dist/data；
+        # 这里再显式校验，保证发布出去的站点有地形与模型清单
         run: |
           test -f dist/index.html
           test -f dist/data/height.f16
           test -f dist/data/terrain.json
-
-      # ── 第二个前端：地形模型编辑，部署到 dist/modeldesigner/ ──────────────
-      - name: 安装编辑器依赖
-        working-directory: modeldesigner
-        run: npm ci
-
-      - name: 生成编辑器地形资产
-        working-directory: modeldesigner
-        run: npm run assets
-
-      - name: 构建编辑器
-        working-directory: modeldesigner
-        run: npm run build
-
-      - name: 合并编辑器到 dist/modeldesigner
-        run: |
-          test -f modeldesigner/dist/index.html
-          mkdir -p dist/modeldesigner
-          cp -r modeldesigner/dist/. dist/modeldesigner/
-
-      - name: 校验双前端产物
-        run: |
-          test -f dist/index.html
-          test -f dist/modeldesigner/index.html
-          test -f dist/modeldesigner/data/height.f16
-          test -f dist/modeldesigner/data/terrain.json
+          test -f dist/data/sat/0_0_128.jpg
+          test "$(find dist/data/sat -name '*.jpg' | wc -l)" -eq 192
+          test -f dist/models/index.json
 
       - name: 配置 Pages
         if: github.event_name != 'pull_request'

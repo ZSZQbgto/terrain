@@ -37,35 +37,47 @@ export class TerrainControls {
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2(0, 0);
     this.enabled = true;
-    // 相机惯性（游览模式开启）：松键后按指数衰减滑行，而不是硬停
+    // 游览模式的相机惯性：起步缓动 + 松键后滑行
     this.inertia = false;
     this.velocity = new THREE.Vector3();
     this._desired = new THREE.Vector3();
     this._move = new THREE.Vector3();
+    this.collisionEnabled = true; // 相机碰撞：不钻地、不出地形边界
+    this.modifiers = { shift: false, ctrl: false }; // Ctrl=缓动，Shift=加速
     this._onKeyDown = (e) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
-      // 修饰键只记状态（Shift 加速 / Ctrl 慢速微调），不拦截浏览器默认行为
-      if (
-        e.code === 'ShiftLeft' ||
-        e.code === 'ShiftRight' ||
-        e.code === 'ControlLeft' ||
-        e.code === 'ControlRight'
-      ) {
-        this.keys.add(e.code);
-        return;
-      }
+      // 修饰键单独记录：它们不在 KEY_SPEED 里，之前放进 keys 集合的方式永远读不到
+      this.modifiers.shift = e.shiftKey;
+      this.modifiers.ctrl = e.ctrlKey || e.metaKey;
       if (KEY_SPEED[e.code]) {
         this.keys.add(e.code);
         e.preventDefault();
       }
     };
-    this._onKeyUp = (e) => this.keys.delete(e.code);
-    this._onBlur = () => this.keys.clear();
+    this._onKeyUp = (e) => {
+      this.modifiers.shift = e.shiftKey;
+      this.modifiers.ctrl = e.ctrlKey || e.metaKey;
+      this.keys.delete(e.code);
+    };
+    this._onBlur = () => {
+      this.keys.clear();
+      this.modifiers.shift = false;
+      this.modifiers.ctrl = false;
+    };
     window.addEventListener('keydown', this._onKeyDown);
     window.addEventListener('keyup', this._onKeyUp);
     window.addEventListener('blur', this._onBlur);
   }
 
+  setTarget(x, y, z) {
+    this.controls.target.set(x, y, z);
+  }
+
+  /**
+   * 一次性开关相机交互。
+   * 注意必须同时设置 OrbitControls 的 enabled —— 只改 this.enabled 时，
+   * 鼠标左键拖动仍会旋转视角（编辑器里拖 gizmo 时会和物体抢指针）。
+   */
   /** 游览模式：相机惯性（起步缓动 + 松键滑行），旋转也更柔 */
   setInertia(on) {
     this.inertia = Boolean(on);
@@ -74,8 +86,15 @@ export class TerrainControls {
     if (!this.inertia) this.velocity.set(0, 0, 0);
   }
 
-  setTarget(x, y, z) {
-    this.controls.target.set(x, y, z);
+  setEnabled(on) {
+    this.enabled = on;
+    this.controls.enabled = on;
+    if (!on) this.keys.clear();
+  }
+
+  /** 相机碰撞开关：关掉后允许钻到地形以下、飞出地形边界 */
+  setCollisionEnabled(on) {
+    this.collisionEnabled = Boolean(on);
   }
 
   /** 相机离地高度（米） */
@@ -182,16 +201,11 @@ export class TerrainControls {
       if (this.keys.has('KeyQ')) up -= 1;
 
       const dtClamped = Math.min(dt, 0.05);
-      // 期望速度（单位/秒）：Shift 加速 3.2×，Ctrl 慢速微调 0.25×
+      // 期望速度（单位/秒）：Ctrl（⌘）= 缓动精细移动，Shift = 加速
       this._desired.set(0, 0, 0);
       if (forward || right || up) {
         const dist = c.position.distanceTo(target);
-        const boost =
-          this.keys.has('ControlLeft') || this.keys.has('ControlRight')
-            ? 0.25
-            : this.keys.has('ShiftLeft') || this.keys.has('ShiftRight')
-              ? 3.2
-              : 1;
+        const boost = this.modifiers.ctrl ? 0.25 : this.modifiers.shift ? 3.2 : 1;
         const speed = Math.max(120, dist * 0.85) * boost;
 
         const fwd = new THREE.Vector3().subVectors(target, c.position);
@@ -231,19 +245,21 @@ export class TerrainControls {
 
       this.controls.update();
 
-      // 防钻地：保持最小离地高度，并限制在地形上方
-      const exag = this.getExaggeration();
-      const relief = this.hf.reliefMeters * exag;
-      const half = this.hf.sizeMeters / 2;
-      const groundY = this.hf.sampleWorld(c.position.x, c.position.z) * relief;
-      const minClear = Math.max(35, c.position.distanceTo(target) * 0.035);
-      if (c.position.y < groundY + minClear) c.position.y = groundY + minClear;
+      // 相机碰撞（可关闭）：防钻地 + 限制在地形范围内
+      if (this.collisionEnabled) {
+        const exag = this.getExaggeration();
+        const relief = this.hf.reliefMeters * exag;
+        const half = this.hf.sizeMeters / 2;
+        const groundY = this.hf.sampleWorld(c.position.x, c.position.z) * relief;
+        const minClear = Math.max(35, c.position.distanceTo(target) * 0.035);
+        if (c.position.y < groundY + minClear) c.position.y = groundY + minClear;
 
-      const limit = half * 2.4;
-      c.position.x = Math.min(limit, Math.max(-limit, c.position.x));
-      c.position.z = Math.min(limit, Math.max(-limit, c.position.z));
-      target.x = Math.min(half, Math.max(-half, target.x));
-      target.z = Math.min(half, Math.max(-half, target.z));
+        const limit = half * 2.4;
+        c.position.x = Math.min(limit, Math.max(-limit, c.position.x));
+        c.position.z = Math.min(limit, Math.max(-limit, c.position.z));
+        target.x = Math.min(half, Math.max(-half, target.x));
+        target.z = Math.min(half, Math.max(-half, target.z));
+      }
       void this.controls.maxPolarAngle;
     }
   }

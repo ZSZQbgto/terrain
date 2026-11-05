@@ -58,8 +58,12 @@ vec4 texBicubic(sampler2D tex, vec2 uv, vec2 texSize) {
 `;
 
 /**
- * 顶点阶段：地形高度全部在 GPU 上从查询纹理解析 ——
+ * 顶点阶段：地形高度全部在 GPU 上从高度图解析 ——
  * position.y 只携带裙边偏移（主网格 0，裙边 -SKIRT），几何本身不含高程数据。
+ *
+ * 位移直接采样原始高度图 uHeight（R16F），而不是打包后的查询纹理：
+ * 地形编辑时只要重新上传高度图，下一帧地形就按新高度渲染（实时），
+ * 而 AO / 梯度（用于着色）可以稍后再异步重建，互不阻塞。
  *
  * uVertexDetail 由每块在绘制前写入：
  *   1 = 双三次采样（近处高精度块，位移平滑无折痕）
@@ -69,8 +73,8 @@ vec4 texBicubic(sampler2D tex, vec2 uv, vec2 texSize) {
 export const terrainVertex = /* glsl */ `
 ${CRC}
 ${BICUBIC}
-uniform sampler2D uTerrain;
-uniform vec2 uTerrainTexel;
+uniform sampler2D uHeight;
+uniform vec2 uHeightTexel;
 uniform float uReliefMeters;
 uniform float uExaggeration;
 uniform float uVertexDetail;
@@ -84,9 +88,9 @@ void main() {
   vUv = uv;
   vec4 t;
   if (uVertexDetail > 0.5) {
-    t = texBicubic(uTerrain, uv, 1.0 / uTerrainTexel);
+    t = texBicubic(uHeight, uv, 1.0 / uHeightTexel);
   } else {
-    t = texture2D(uTerrain, uv);
+    t = texture2D(uHeight, uv);
   }
   float y = (t.r * uReliefMeters + position.y) * uExaggeration;
   vec3 p = vec3(position.x, y, position.z);
@@ -314,64 +318,5 @@ void main() {
   col = mix(col, uFogColor, max(exp(-abs(d.y) * 7.0) * 0.55, smoothstep(0.06, -0.25, d.y)));
 
   gl_FragColor = vec4(linearToSRGB(col), 1.0);
-}
-`;
-
-export const waterVertex = /* glsl */ `
-uniform float uTime;
-varying vec3 vWorld;
-varying vec2 vUv;
-varying float vViewDist;
-
-void main() {
-  vUv = uv;
-  vec4 wp = modelMatrix * vec4(position, 1.0);
-  vWorld = wp.xyz;
-  vViewDist = length(wp.xyz - cameraPosition);
-  gl_Position = projectionMatrix * viewMatrix * wp;
-}
-`;
-
-export const waterFragment = /* glsl */ `
-precision highp float;
-${COMMON}
-uniform float uTime;
-uniform vec3 uWaterColor;
-uniform vec3 uSkyColor;
-uniform vec3 uSunDir;
-uniform vec3 uSunColor;
-uniform vec3 uFogColor;
-uniform float uFogDensity;
-uniform float uHazeHeight;
-uniform float uHalfSize;
-uniform float uEdgeFadeStart;
-uniform float uEdgeFadeEnd;
-uniform float uOpacity;
-varying vec3 vWorld;
-varying vec2 vUv;
-varying float vViewDist;
-
-void main() {
-  vec2 p = vWorld.xz;
-  // 两组交叉微波纹，纯矢量求导得到扰动法线
-  float t = uTime * 0.35;
-  float w1 = valueNoise(p * 0.02 + vec2(t, t * 0.7));
-  float w2 = valueNoise(p * 0.055 - vec2(t * 0.8, t));
-  vec3 n = normalize(vec3((w1 - 0.5) * 0.09 + (w2 - 0.5) * 0.05, 1.0,
-                          (w2 - 0.5) * 0.09 + (w1 - 0.5) * 0.05));
-
-  float fres = pow(1.0 - max(dot(n, normalize(cameraPosition - vWorld)), 0.0), 4.0);
-  vec3 col = mix(uWaterColor, uSkyColor, clamp(fres * 0.85, 0.0, 0.7));
-  float spec = pow(max(dot(reflect(-uSunDir, n), normalize(cameraPosition - vWorld)), 0.0), 180.0);
-  col += uSunColor * spec * 1.6;
-
-  // 与地形同一套日间薄雾：水面比山脊更朦胧，边界处淡出到完全透明
-  vec3 toPoint = vWorld - cameraPosition;
-  float haze = hazeFactor(vViewDist, vWorld.y, uFogDensity, uHazeHeight);
-  float edgeFade = 1.0 - smoothstep(uEdgeFadeStart, uEdgeFadeEnd, edgeDistance(vWorld.xz, uHalfSize));
-  col = mix(col, hazeTint(uFogColor, uSunColor, uSunDir, toPoint), haze);
-  col = mix(col, uFogColor, edgeFade);
-
-  gl_FragColor = vec4(linearToSRGB(col), uOpacity * (1.0 - haze * 0.7) * (1.0 - edgeFade));
 }
 `;
